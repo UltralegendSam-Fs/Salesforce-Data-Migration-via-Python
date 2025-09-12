@@ -19,10 +19,7 @@ import requests
 from simple_salesforce import Salesforce
 from Auth_Cred.auth import connect_salesforce
 from Auth_Cred.config import SF_SOURCE, SF_TARGET
-
-# === Files & Directories ===
-FILES_DIR = os.path.join(os.path.dirname(__file__), "files")
-os.makedirs(FILES_DIR, exist_ok=True)
+from mappings import FILES_DIR
 
 INPUT_MAPPING_FILE = os.path.join(FILES_DIR, "contentdocumentlink_mapping.csv")
 OUTPUT_VERSION_MAPPING_FILE = os.path.join(FILES_DIR, "contentversion_migration_mapping.csv")

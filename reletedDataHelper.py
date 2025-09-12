@@ -8,16 +8,14 @@ import os
 import pandas as pd
 from typing import Dict, List
 from bs4 import BeautifulSoup
+from mappings import fetch_createdByIds, build_owner_mapping, FILES_DIR
+
 
 # === Tunables / Limits ===
 CHUNK_SIZE_API = 200          # Bulk insert batch size (Salesforce limit for sObject collections)
 CHUNK_SIZE_ACTIVITIES = 50    # How many activity IDs to process per outer loop (caller can override)
 SOQL_IN_LIMIT = 1000          # Salesforce 'IN (...)' list size hard limit
 
-
-
-FILES_DIR = os.path.join(os.path.dirname(__file__), "files")
-os.makedirs(FILES_DIR, exist_ok=True)
 
 activity_related_migration = os.path.join(FILES_DIR, "activity_related_migration.csv")
 
@@ -67,10 +65,17 @@ def process_body(body: str) -> str:
     #return re.body(r"<[^>]+>", "", body)
     return re.sub(r"<[^>]+>", "", body)
 
-def related_recordid_mapping(sf_source,records,object_type):
+def related_recordid_mapping(sf_source,sf_target,records,object_type):
     doc_ids = set()
+    createdBy_ids = set()
+    createdBy_mappings = {}
+
+    createdBy_ids = {rec["CreatedById"] for rec in records if rec.get("CreatedById")}
+    createdBy_mappings = fetch_createdByIds(sf_target, createdBy_ids)
+
 
     for rec in records:
+        rec["CreatedById"] = createdBy_mappings.get(rec.get("CreatedById"), None)
         if object_type=="Comment":
             body = rec.get("CommentBody") or ""
         else:
@@ -102,13 +107,20 @@ def related_recordid_mapping(sf_source,records,object_type):
     for rec in records:
         if object_type=="Comment":
             body = rec.get("CommentBody") or ""
+            new_body = re.sub(r'<img[^>]*>(?:</img>)?', '', body, flags=re.IGNORECASE)
+            rec["CommentBody"] = new_body.strip()
+
         else:
             body = rec.get("Body") or ""
+            new_body = re.sub(r'<img[^>]*>(?:</img>)?', '', body, flags=re.IGNORECASE)
+            rec["Body"] = new_body.strip()
+            
         matches = re.findall(r'<img[^>]+src="sfdc://([^"]+)"', body)
         if matches:
             doc_id = matches[0]  # pick first if multiple
             if doc_id in content_map:
                 rec["RelatedRecordId"] = content_map[doc_id]
+                
                 print(f"🔗 Mapped FeedItem {rec}")
     return records
 
@@ -126,6 +138,7 @@ def _bulk_insert_with_fallback(sf_target, sobject_name: str, records: List[Dict]
     try:
         # Try BULK
         inserted = getattr(sf_target.bulk, sobject_name).insert(records, batch_size=min(len(records), CHUNK_SIZE_API))
+        print(f"Bulk insert results: {inserted}")
         # Normalize result structure
         for res in inserted:
             results.append({
@@ -161,9 +174,21 @@ def migrate_attachments(sf_source, sf_target, src_activity_ids: List[str], activ
         return
 
     for ids_clause in _soql_in_chunks(src_activity_ids):
-        soql = f"SELECT Id, Name, ParentId, ContentType FROM Attachment WHERE ParentId IN {ids_clause}"
+        soql = f"SELECT Id, Name, ParentId, CreatedDate, CreatedById, OwnerId, ContentType FROM Attachment WHERE ParentId IN {ids_clause}"
         print("migrate_attachments soql", soql)
         attachments = sf_source.query_all(soql)["records"]
+        createdBy_ids = set()
+        createdBy_mappings = {}
+        owner_ids = set()
+        owner_mappings = {}
+
+        # createdBy_ids = {att["CreatedById"] for att in attachments if att.get("CreatedById")}
+        # createdBy_mappings = fetch_createdByIds(sf_target, createdBy_ids)
+
+        owner_ids = {att["OwnerId"] for att in attachments if att.get("OwnerId")}
+        owner_mappings = build_owner_mapping(sf_source, sf_target, owner_ids)
+
+
         logging.info(f"[Attachments] Found {len(attachments)} for {len(ids_clause)} activities chunk")
 
         for att in attachments:
@@ -189,10 +214,18 @@ def migrate_attachments(sf_source, sf_target, src_activity_ids: List[str], activ
                     "Name": att.get("Name"),
                     "ParentId": tgt_parent,
                     "Body": base64.b64encode(file_bytes).decode("utf-8"),
+                    "createdDate": att.get("CreatedDate"),
                 }
                 # optional: include ContentType if present
                 if att.get("ContentType"):
                     payload["ContentType"] = att["ContentType"]
+
+                # optional: remap CreatedById and OwnerId if present
+                # if att.get("CreatedById") and att["CreatedById"] in createdBy_mappings:
+                #     payload["CreatedById"] = createdBy_mappings[att["CreatedById"]]
+                if att.get("OwnerId") and att["OwnerId"] in owner_mappings:
+                    payload["OwnerId"] = owner_mappings[att["OwnerId"]]
+
 
                 create_res = sf_target.Attachment.create(payload)
                 results_out.append({
@@ -392,7 +425,7 @@ def migrate_feed(sf_source, sf_target, src_activity_ids: List[str], activity_map
     for ids_clause in _soql_in_chunks(src_activity_ids):
         # 1) Fetch FeedItems for this chunk of parents
         fi_soql = f"""
-            SELECT Id, ParentId, Body, RelatedRecordId
+            SELECT Id, ParentId, Body, LinkUrl, Type, RelatedRecordId,CreatedById, CreatedDate,IsRichText,Visibility,Title
             FROM FeedItem
             WHERE ParentId IN {ids_clause}
         """
@@ -400,7 +433,7 @@ def migrate_feed(sf_source, sf_target, src_activity_ids: List[str], activity_map
         feeditems = sf_source.query_all(fi_soql)["records"]
         if not feeditems:
             continue
-        feeditems = related_recordid_mapping(sf_source, feeditems,"Item")
+        feeditems = related_recordid_mapping(sf_source,sf_target, feeditems,"Item")
 
         # Group FeedItems by Parent so we can map to correct tgt ParentId
         feeditems_by_parent = {}
@@ -428,9 +461,16 @@ def migrate_feed(sf_source, sf_target, src_activity_ids: List[str], activity_map
             # Build payloads
             to_insert = []
             for fi in fi_list:
+                feed_body =fi.get("Body") or ""
                 payload = {
                     "ParentId": tgt_parent,
-                    "Body": process_body(fi.get("Body") or "")
+                    "Body":feed_body,
+                    "createdDate": fi.get("CreatedDate"),
+                    "CreatedById": fi.get("CreatedById"),
+                    "IsRichText": fi.get("IsRichText"),
+                    "Visibility": fi.get("Visibility"),
+                    "Title": fi.get("Title"),
+                    "LinkUrl": fi.get("LinkUrl"),
                 }
 
                 # ✅ remap RelatedRecordId if it points to a migrated file
@@ -443,6 +483,7 @@ def migrate_feed(sf_source, sf_target, src_activity_ids: List[str], activity_map
                         payload["RelatedRecordId"] = tgt_related
 
                 to_insert.append(payload)
+                print(f"Prepared FeedItem for insert: {payload}")
 
             # Insert in CHUNK_SIZE_API batches; build mapping in-order
             for batch in _chunk_list(to_insert, CHUNK_SIZE_API):
@@ -488,14 +529,14 @@ def migrate_feed(sf_source, sf_target, src_activity_ids: List[str], activity_map
         src_feed_ids = list(source_to_target_fi.keys())
         for fi_ids_clause in _soql_in_chunks(src_feed_ids):
             fc_soql = f"""
-                SELECT Id, FeedItemId, CommentBody, RelatedRecordId
+                SELECT Id, FeedItemId, CommentBody, RelatedRecordId, CreatedDate, CreatedById,IsRichText
                 FROM FeedComment
                 WHERE FeedItemId IN {fi_ids_clause}
             """
             comments = sf_source.query_all(fc_soql)["records"]
             if not comments:
                 continue
-            comments = related_recordid_mapping(sf_source, comments,"Comment")
+            comments = related_recordid_mapping(sf_source,sf_target, comments,"Comment")
 
             # Build payloads with mapped target FeedItemIds
             to_insert_comments = []
@@ -515,10 +556,13 @@ def migrate_feed(sf_source, sf_target, src_activity_ids: List[str], activity_map
                         "Error": "Parent FeedItem not migrated"
                     })
                     continue
-
+                comment_body = c.get("CommentBody") or ""
                 payload = {
                     "FeedItemId": tgt_fi,
-                    "CommentBody": process_body(c.get("CommentBody") or "")
+                    "CommentBody": comment_body,
+                    "createdDate": c.get("CreatedDate"),
+                    "CreatedById": c.get("CreatedById"),
+                    "IsRichText": c.get("IsRichText"),
                 }
 
                 # ✅ remap RelatedRecordId if it points to a migrated file
@@ -556,6 +600,9 @@ def migrate_feed(sf_source, sf_target, src_activity_ids: List[str], activity_map
                             "SourceRecordId": c_src["Id"],
                             "TargetRecordId": None,
                             "Status": "Failed",
-                            "Error": "; ".join(resp.get("errors", []))
+                            "Error": "; ".join(
+                                [err["message"] if isinstance(err, dict) and "message" in err else str(err)
+                                for err in resp.get("errors", [])]
+                            )
                         })
 

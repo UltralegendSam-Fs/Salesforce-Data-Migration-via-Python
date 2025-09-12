@@ -3,22 +3,21 @@ import pandas as pd
 import logging
 from Auth_Cred.auth import connect_salesforce
 from Auth_Cred.config import SF_SOURCE, SF_TARGET
-from mappings import fetch_target_mappings   # ← Imported here
+from mappings import fetch_target_mappings,FILES_DIR
 
 # Objects with their filter conditions
 OBJECT_CONDITIONS = {
-    "Account": "RecordType.Name IN ('Parent Company','Brand','Retired','Dealer') AND IsPersonAccount = false",
+    "Account": "RecordType.Name IN ('Parent Company','Brand','Dealer') AND IsPersonAccount = false",
     "FSL__Optimization_Data__c ": ""
 }
 
 BATCH_SIZE = 2000
 
-# === Ensure files folder exists ===
-FILES_DIR = os.path.join(os.path.dirname(__file__), "files")
-os.makedirs(FILES_DIR, exist_ok=True)
 
 # === Output file path inside files folder ===
-OUTPUT_FILE = os.path.join(FILES_DIR, "parent_id_mapping.xlsx")
+# OUTPUT_FILE = os.path.join(FILES_DIR, "parent_id_mapping.xlsx")
+OUTPUT_FILE = os.path.join(FILES_DIR, "parent_id_mapping.csv")   # ← CSV instead of XLSX
+
 LOG_FILE = os.path.join(FILES_DIR, "migration.log")
 
 # === Logging configuration ===
@@ -44,13 +43,13 @@ def fetch_filtered_attachments(sf, object_name, condition):
         soql = f"""
             SELECT Id, ParentId
             FROM Attachment
-            WHERE Parent.Type = '{object_name}'
+            WHERE CreatedDate >= LAST_N_MONTHS:24 AND Parent.Type = '{object_name}'
         """
     else:
         soql = f"""
             SELECT Id, ParentId
             FROM Attachment
-            WHERE ParentId IN (
+            WHERE CreatedDate >= LAST_N_MONTHS:24 AND ParentId IN (
                 SELECT Id FROM {object_name} WHERE {condition}
             )
         """
@@ -98,8 +97,12 @@ def main():
                 "TargetParentId": tgt_parent
             })
 
+    # df = pd.DataFrame(all_mappings)
+    # df.to_excel(OUTPUT_FILE, index=False)
+    # logging.info(f"Mapping saved to {OUTPUT_FILE}")
+
     df = pd.DataFrame(all_mappings)
-    df.to_excel(OUTPUT_FILE, index=False)
+    df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")  # ← CSV export
     logging.info(f"Mapping saved to {OUTPUT_FILE}")
 
 
