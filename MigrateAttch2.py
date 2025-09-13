@@ -3,16 +3,13 @@ import pandas as pd
 import base64
 import logging
 import requests
-from Auth_Cred.config import SF_SOURCE, SF_TARGET, MAPPING_FILE   # ← imported instead of redefining
+from Auth_Cred.config import SF_SOURCE, SF_TARGET   # ← imported instead of redefining
 from Auth_Cred.auth import connect_salesforce                     # ← imported instead of redefining
-
+from mappings import FILES_DIR
 BATCH_LOG_INTERVAL = 50  # Log after every 50 uploads
 
-# === Ensure files folder exists ===
-FILES_DIR = os.path.join(os.path.dirname(__file__), "files")
-os.makedirs(FILES_DIR, exist_ok=True)
-
 LOG_FILE = os.path.join(FILES_DIR, "migration.log")
+MAPPING_FILE = os.path.join(FILES_DIR, "parent_id_mapping.csv")
 
 # === Logging configuration ===
 logging.basicConfig(filename=LOG_FILE,level=logging.INFO,format="%(asctime)s - %(message)s")
@@ -51,7 +48,7 @@ def main():
     sf_target = connect_salesforce(SF_TARGET)
 
     # Step 2: Read mapping file
-    df = pd.read_excel(MAPPING_FILE)
+    df = pd.read_csv(MAPPING_FILE)
 
     success_count = 0
     fail_count = 0

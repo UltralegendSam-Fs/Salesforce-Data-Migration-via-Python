@@ -11,11 +11,7 @@ import os
 from Auth_Cred.auth import connect_salesforce
 from Auth_Cred.config import SF_SOURCE, SF_TARGET
 from activity_config import ACTIVITY_CONFIG, OBJECT_CONDITIONS
-from mappings import fetch_target_mappings
-
-# === folders & files ===
-FILES_DIR = os.path.join(os.path.dirname(__file__), "files")
-os.makedirs(FILES_DIR, exist_ok=True)
+from mappings import fetch_target_mappings, fetch_service_appointment_ids,FILES_DIR
 
 task_export = os.path.join(FILES_DIR, "task_export.csv")     
 event_export = os.path.join(FILES_DIR, "event_export.csv")
@@ -33,7 +29,14 @@ def filter_parent_ids_by_object(sf, parent_ids, object_name):
     """Apply OBJECT_CONDITIONS filters for parent objects."""
     if not parent_ids or object_name not in OBJECT_CONDITIONS:
         return parent_ids  # nothing to filter
+    
+    # Special case: ServiceAppointment → needs two queries
+    if object_name == "ServiceAppointment":
+        filtered_ids = set()
+        filtered_ids=fetch_service_appointment_ids(sf,parent_ids)
+        return filtered_ids
 
+    # Generic case (other objects with single condition)
     condition = OBJECT_CONDITIONS[object_name]
     if not condition:
         return parent_ids  # no extra filter
@@ -79,7 +82,7 @@ def export_activity(sf_source, sf_target, object_name, output_file, batch_size=2
     if who_ids:
         mapping = fetch_target_mappings(sf_target, "Contact", who_ids, batch_size)
         parent_mappings.update(mapping)
-
+    print("activities",activities)
     # Write export CSV
     with open(output_file, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)

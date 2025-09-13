@@ -16,10 +16,7 @@ import os
 from Auth_Cred.auth import connect_salesforce
 from Auth_Cred.config import SF_SOURCE, SF_TARGET
 from activity_config import TASK_FIELDS, EVENT_FIELDS
-
-# === folders & files ===
-FILES_DIR = os.path.join(os.path.dirname(__file__), "files")
-os.makedirs(FILES_DIR, exist_ok=True)
+from mappings import fetch_createdByIds, build_owner_mapping,FILES_DIR
 
 task_export = os.path.join(FILES_DIR, "task_export.csv")     
 task_import_log = os.path.join(FILES_DIR, "task_import_log.csv")
@@ -32,7 +29,7 @@ def fetch_records(sf, object_name, ids, fields):
     print(f"[DEBUG] Fetching records: {soql}")
     return sf.query_all(soql)["records"]
 
-def build_record(source_record, mapping_row, valid_fields, object_name):
+def build_record(source_record, mapping_row, valid_fields, object_name, createdBy_mappings, owner_mappings):
     """Build record for insert into TARGET, remapping parents + special Request__c handling."""
     record = {}
 
@@ -54,11 +51,19 @@ def build_record(source_record, mapping_row, valid_fields, object_name):
         record["WhoId"] = tgt_who
 
     # 🔹 Special case: If WhatId is a Request__c, also populate Request__c field
-    #    We can detect this because mapping_row["Source_WhatId"] is from a Request__c
     if object_name == "Task" and mapping_row.get("Source_WhatId") and tgt_what:
-        # If the source WhatId belonged to a Request__c, duplicate into Request__c field
         if mapping_row["Source_WhatId"].startswith("a19"):  # Example: Request__c prefix is "a0X"
             record["Request__c"] = tgt_what
+    
+    # 🔹 Map CreatedById using createdBy_mappings
+    # src_createdBy = source_record.get("CreatedById")
+    # if src_createdBy and src_createdBy in createdBy_mappings:
+    #     record["CreatedById"] = createdBy_mappings[src_createdBy]
+    
+    # 🔹 Map OwnerId using owner_mappings
+    src_owner = source_record.get("OwnerId")
+    if src_owner and src_owner in owner_mappings:
+        record["OwnerId"] = owner_mappings[src_owner]
 
     # 🔹 Hardcode RecordTypeId for Task/Event
     if object_name == "Task":
@@ -71,16 +76,28 @@ def build_record(source_record, mapping_row, valid_fields, object_name):
 
 def import_activities(sf_source, sf_target, object_name, fields, mapping_csv, log_csv):
     """Migrate Task/Event using mapping file."""
+
+    createdBy_mappings = {}
+
     # Read mappings
     with open(mapping_csv, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         mappings = list(reader)
 
     source_ids = [m["Source_Activity_Id"] for m in mappings]
+    if not source_ids:
+        print(f"[WARN] No Source_Activity_Id found in {mapping_csv}. Skipping.")
+        return
 
     # Fetch full records from SOURCE
     print(f"[INFO] Fetching {len(source_ids)} {object_name} records from SOURCE...")
     source_records = fetch_records(sf_source, object_name, source_ids, fields)
+
+    # createdBy_ids = {fi["CreatedById"] for fi in source_records}
+    # createdBy_mappings = fetch_createdByIds(sf_target, createdBy_ids)
+    
+    ownerIds = {fi["OwnerId"] for fi in source_records}
+    owner_mappings = build_owner_mapping(sf_source, sf_target, ownerIds)
 
     # Index by Id for quick lookup
     source_map = {rec["Id"]: rec for rec in source_records}
@@ -100,7 +117,7 @@ def import_activities(sf_source, sf_target, object_name, fields, mapping_csv, lo
             })
             continue
 
-        record = build_record(source_record, m, fields,object_name)
+        record = build_record(source_record, m, fields,object_name,createdBy_mappings,owner_mappings)
         records_to_insert.append(record)
 
     # Bulk insert into TARGET

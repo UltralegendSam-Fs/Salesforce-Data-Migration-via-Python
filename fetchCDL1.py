@@ -21,10 +21,7 @@ from simple_salesforce import Salesforce
 from Auth_Cred.auth import connect_salesforce
 from Auth_Cred.config import SF_SOURCE, SF_TARGET
 from typing import List, Dict, Iterable
-
-# === Files & Directories ===
-FILES_DIR = os.path.join(os.path.dirname(__file__), "files")
-os.makedirs(FILES_DIR, exist_ok=True)
+from mappings import FILES_DIR, fetch_service_appointment_ids
 
 OUTPUT_CSV = os.path.join(FILES_DIR, "contentdocumentlink_mapping.csv")
 LOG_FILE = os.path.join(FILES_DIR, "contentdocumentlink_mapping.log")
@@ -43,18 +40,18 @@ MAX_RETRIES = 5
 
 # === Object Conditions ===
 # OBJECT_CONDITIONS = {
-#     "Account": "RecordType.Name IN ('Parent Company','Brand','Retired','Dealer') AND IsPersonAccount = false",
-#     "Contact": "",
-#     "EmailMessage": "",
-#     "Impact_Tracker__c": "",
-#     "Order": "",
-#     "Request__c": "",
+#     "Account": "RecordType.Name IN ('Parent Company','Brand','Dealer') AND IsPersonAccount = false",
+#     "Contact": "Account.RecordType.Name IN ('Parent Company','Brand','Dealer') AND Account.IsPersonAccount = false",
+#     "CollaborationGroup": "",
+#     "Impact_Tracker__c": "Clients_Brands__c!=null and Clients_Brands__r.RecordType.name in ('Parent Company','Brand','Dealer')",
+#     "Order": "RecordType.name in ('Field Win Win','Gift Card Procurement','Incentive')",
+#     "Request__c": "Brand__r.RecordType.name in ('Parent Company','Brand','Dealer') and Division__r.RecordType.name ='Brand Program')",
 #     "ServiceAppointment": "",
 #     "User": "isActive = true",
-#     "WorkOrder": ""
+#     "WorkOrder": "Field_Win_Win__c IN (select id from order where  RecordType.name in ('Field Win Win','Gift Card Procurement','Incentive'))"
 # }
 OBJECT_CONDITIONS = {
-    "Account": "RecordType.Name IN ('Parent Company','Brand','Retired','Dealer') AND IsPersonAccount = false"
+    "Account": "RecordType.Name IN ('Parent Company','Brand','Dealer') AND IsPersonAccount = false"
 }
 
 # --------------------------------------------------
@@ -82,10 +79,17 @@ def safe_query_all(sf: Salesforce, soql: str):
 
 
 def fetch_source_parent_ids(sf_source: Salesforce, obj: str, condition: str) -> List[str]:
+     
+    if obj == "ServiceAppointment":
+        filtered_ids = set()
+        filtered_ids=fetch_service_appointment_ids(sf_source)
+        return filtered_ids
+     
     if condition.strip():
         soql = f"SELECT Id FROM {obj} WHERE {condition}"
     else:
         soql = f"SELECT Id FROM {obj}"
+        
     logging.info(f"Fetching parent Ids from source for {obj} with condition: {condition or 'NO CONDITION'}")
     records = safe_query_all(sf_source, soql)
     ids = [r["Id"] for r in records]
