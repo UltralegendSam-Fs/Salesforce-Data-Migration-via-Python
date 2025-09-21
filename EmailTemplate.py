@@ -171,7 +171,7 @@ def export_template(sf_source, sf_target, object_name, batch_size=200):
     
     em_records = fetch_em_records(sf_source)
     template_ids.add(r["EmailTemplateId"] for r in em_records if r.get("EmailTemplateId"))
-    print(f"[DEBUG] Unique EmailTemplateIds from EmailMessages: {len(template_ids)}")
+    print(f"[DEBUG] Unique EmailTemplateIds from EmailMessages: {len(templateIds)}")
     logging.info(f"[INFO] Found {len(template_ids)} unique EmailTemplateIds")
     if not template_ids:
         return

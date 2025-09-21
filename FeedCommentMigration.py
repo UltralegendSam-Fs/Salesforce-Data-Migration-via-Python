@@ -15,71 +15,48 @@ import re
 from simple_salesforce import Salesforce
 from Auth_Cred.auth import connect_salesforce
 from Auth_Cred.config import SF_SOURCE, SF_TARGET
-from mappings import fetch_target_mappings, fetch_createdByIds, FILES_DIR
+from mappings import fetch_target_mappings, fetch_createdByIds,related_recordid_mapping, FILES_DIR
 
 BATCH_SIZE = 200
+SOQL_SIZE = 500
 
 INPUT_CSV = os.path.join(FILES_DIR, "feeditem_results.csv")
 OUTPUT_CSV = os.path.join(FILES_DIR, "feedcomment_migration_log.csv")
 
-# === Fetch FeedComments from Source ===
-def fetch_feedcomments(sf_source: Salesforce, feeditem_ids: set[str]):
+def fetch_feedcomments(sf_source: Salesforce,sf_target: Salesforce, feeditem_ids: set[str], batch_size: int = 200):
+    """
+    Fetch FeedComment records for a given set of FeedItem IDs with batching.
+    """
     if not feeditem_ids:
         return []
-    ids_str = ",".join([f"'{fid}'" for fid in feeditem_ids])
-    query = f"""
-        SELECT Id, CommentBody, CreatedById, CreatedDate, ParentId, FeedItemId, RelatedRecordId,IsRichText,CommentType
-        FROM FeedComment
-        WHERE FeedItemId IN ({ids_str})
-        ORDER BY CreatedDate ASC
-    """
-    results = sf_source.query_all(query)["records"]
-    print(f"[INFO] Fetched {len(results)} FeedComments from source org")
-    results = related_recordid_mapping(sf_source, results)  # pass only sf + records
-    return results
 
-def related_recordid_mapping(sf_source,records):
-    doc_ids = set()
+    feeditem_ids = list(feeditem_ids)
+    all_results = []
 
-    for rec in records:
-        body = rec.get("CommentBody") or ""
-        matches = re.findall(r'<img[^>]+src="sfdc://([^"]+)"', body)
-        for doc_id in matches:
-            doc_ids.add(doc_id)
-
-    if not doc_ids:
-        print("⚠️ No <img> tags found in FeedComment bodies, skipping RelatedRecordId mapping")
-        return records  # return unchanged
-    else:
-        print(f"[INFO] Found {len(doc_ids)} unique ContentDocumentIds in FeedComment bodies")
-    
-    
-    # Step 2: Fetch latest ContentVersion for all unique ContentDocumentIds
-    content_map = {}  # {ContentDocumentId: ContentVersionId}
-
-    if doc_ids:
-        ids_str = ",".join([f"'{d}'" for d in doc_ids])
-        ver_soql = f"""
-            SELECT ContentDocumentId, Id
-            FROM ContentVersion
-            WHERE ContentDocumentId IN ({ids_str}) AND IsLatest = true
+    for i in range(0, len(feeditem_ids), SOQL_SIZE):
+        batch = feeditem_ids[i : i + SOQL_SIZE]
+        ids_str = ",".join([f"'{fid}'" for fid in batch])
+        query = f"""
+            SELECT Id, CommentBody, CreatedById, CreatedDate, ParentId, FeedItemId, 
+                   RelatedRecordId, IsRichText, CommentType
+            FROM FeedComment
+            WHERE FeedItemId IN ({ids_str})
+            ORDER BY CreatedDate ASC
         """
-        ver_q = sf_source.query_all(ver_soql)["records"]
-        
-        for v in ver_q:
-            content_map[v["ContentDocumentId"]] = v["Id"]
 
-    # Step 3: Update each record with RelatedRecordId if image found
-    for rec in records:
-        body = rec.get("CommentBody") or ""
-        matches = re.findall(r'<img[^>]+src="sfdc://([^"]+)"', body)
-        if matches:
-            doc_id = matches[0]  # pick first if multiple
-            if doc_id in content_map:
-                rec["RelatedRecordId"] = content_map[doc_id]
-                body = re.sub(r'<img[^>]*>(?:</img>)?', '', body, flags=re.IGNORECASE)
-                rec["CommentBody"] = body.strip()
-    return records
+        try:
+            results = sf_source.query_all(query)["records"]
+            all_results.extend(results)
+            print(f"[DEBUG] Batch {i//SOQL_SIZE+1}: fetched {len(results)} FeedComments")
+        except Exception as e:
+            print(f"[ERROR] Failed fetching FeedComments batch {i//SOQL_SIZE+1}: {e}")
+            continue
+
+    print(f"[INFO] Fetched total {len(all_results)} FeedComments from source org")
+
+    # Apply mapping once on all collected results
+    all_results = related_recordid_mapping(sf_source,sf_target, all_results,"Comment")
+    return all_results
 
 def insert_feedcomments(sf: Salesforce, comments, feeditem_mapping):
     inserted_ids = []
@@ -89,25 +66,25 @@ def insert_feedcomments(sf: Salesforce, comments, feeditem_mapping):
     related_ids = {c["RelatedRecordId"] for c in comments if c.get("RelatedRecordId")}
     relatedId_mappings = fetch_target_mappings(sf, "ContentVersion", related_ids, BATCH_SIZE)
 
-    createdBy_Ids = {c["CreatedById"] for c in comments}
-    createdBy_mappings = fetch_createdByIds(sf, createdBy_Ids)
+    # createdBy_Ids = {c["CreatedById"] for c in comments}
+    # createdBy_mappings = fetch_createdByIds(sf, createdBy_Ids)
 
     for c in comments:
         try:
-            tgt_createdBy = createdBy_mappings.get(c["CreatedById"])
+            # tgt_createdBy = createdBy_mappings.get(c["CreatedById"])
             tgt_feeditem = feeditem_mapping.get(c["FeedItemId"])
 
-            if not tgt_feeditem or not tgt_createdBy:
-                print(f"[WARN] Skipping FeedComment {c['Id']} - Missing FeedItem or CreatedBy mapping")
+            if not tgt_feeditem :
+                print(f"[WARN] Skipping FeedComment {c['Id']} - Missing FeedItem mapping")
                 inserted_ids.append((c["Id"], None, c["FeedItemId"], tgt_feeditem, "Skipped - Missing mapping"))
                 continue
 
             new_comment = {
                 "FeedItemId": tgt_feeditem,
                 "CommentBody": c.get("CommentBody", ""),
-                "CreatedById": tgt_createdBy,
+                "CreatedById": c.get("CreatedById"),  
                 "IsRichText": c.get("IsRichText"),
-                "CreatedDate": c["CreatedDate"]
+                "CreatedDate": c.get("CreatedDate")
             }
             if c.get("RelatedRecordId") in relatedId_mappings:
                 new_comment["RelatedRecordId"] = relatedId_mappings[c["RelatedRecordId"]]
@@ -152,7 +129,7 @@ def migrate_feedcomments(sf_source, sf_target):
 
     print(f"[INFO] Found {len(feeditem_mapping)} FeedItems in mapping CSV")
 
-    comments = fetch_feedcomments(sf_source, set(feeditem_mapping.keys()))
+    comments = fetch_feedcomments(sf_source, sf_target,set(feeditem_mapping.keys()))
     if not comments:
         print(f"[INFO] No comments found")
         return

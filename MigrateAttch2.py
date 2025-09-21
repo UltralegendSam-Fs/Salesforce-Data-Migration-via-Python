@@ -19,7 +19,8 @@ def download_attachment(sf, att_id):
     """Download attachment binary from source"""
     url = f"{sf.base_url}sobjects/Attachment/{att_id}/Body"
     headers = {"Authorization": f"Bearer {sf.session_id}"}
-    response = requests.get(url, headers=headers)
+    # response = requests.get(url, headers=headers)
+    response = sf.session.get(url, headers=headers)
     if response.status_code == 200:
         return base64.b64encode(response.content).decode("utf-8")
     else:
@@ -46,6 +47,8 @@ def main():
     # Step 1: Connect to both orgs
     sf_source = connect_salesforce(SF_SOURCE)
     sf_target = connect_salesforce(SF_TARGET)
+    print("sf_source : ",sf_source)
+    print("sf_target : ",sf_target)
 
     # Step 2: Read mapping file
     df = pd.read_csv(MAPPING_FILE)
@@ -77,12 +80,15 @@ def main():
 
         except Exception as e:
             logging.error(f"Error processing attachment {attachment_id}: {e}")
+            print(f"Error processing attachment {attachment_id}: {e}")
             fail_count += 1
 
         if (success_count + fail_count) % BATCH_LOG_INTERVAL == 0:
             logging.info(f"Processed {success_count + fail_count} attachments: Success={success_count}, Fail={fail_count}")
+            print(f"Processed {success_count + fail_count} attachments: Success={success_count}, Fail={fail_count}")
 
     logging.info(f"Migration complete. Success={success_count}, Fail={fail_count}")
+    print(f"Migration complete. Success={success_count}, Fail={fail_count}")
 
 
 if __name__ == "__main__":

@@ -20,10 +20,11 @@ import logging
 from simple_salesforce import Salesforce
 from Auth_Cred.auth import connect_salesforce
 from Auth_Cred.config import SF_SOURCE, SF_TARGET
-from typing import List, Dict, Iterable
-from mappings import FILES_DIR, fetch_service_appointment_ids
+from typing import Dict,Iterable, List, Generator, Any
+from mappings import FILES_DIR, fetch_service_appointment_ids,fetch_user_ids
 
 OUTPUT_CSV = os.path.join(FILES_DIR, "contentdocumentlink_mapping.csv")
+file_exists = os.path.exists(OUTPUT_CSV)
 LOG_FILE = os.path.join(FILES_DIR, "contentdocumentlink_mapping.log")
 
 # === Logging configuration ===
@@ -34,30 +35,36 @@ logging.basicConfig(
 )
 
 # === Runtime config ===
-CHUNK_SIZE = 800
+CHUNK_SIZE = 200
 SLEEP_BETWEEN_RETRIES = 2
 MAX_RETRIES = 5
 
 # === Object Conditions ===
+OBJECT_CONDITIONS = {
+    "Account": "RecordType.Name IN ('Parent Company','Brand','Dealer') AND IsPersonAccount = false AND DE_Is_Shell_Account__c = false ",
+    "Contact": "Account.RecordType.Name IN ('Parent Company','Brand','Dealer') AND Account.IsPersonAccount = false",
+    "Impact_Tracker__c": "Clients_Brands__c!=null and Clients_Brands__r.RecordType.name in ('Parent Company','Brand','Dealer')",
+    "Order": "RecordType.name in ('Field Win Win','Gift Card Procurement','Incentive') AND Account.recordtype.name IN  ('Parent Company','Brand','Dealer')",
+    "Request__c": "Id in (select Request__c from Request_Brand_Division__c where   Brand__r.RecordType.name in ('Parent Company','Brand','Dealer') and Division__r.RecordType.name ='Brand Program')",
+    "ServiceAppointment": "",
+    "User": "isActive = true",
+    "WorkOrder": "Field_Win_Win__c IN (select id from order where  RecordType.name in ('Field Win Win','Gift Card Procurement','Incentive') AND Account.recordtype.name IN ('Parent Company','Brand','Dealer'))"
+}
+
 # OBJECT_CONDITIONS = {
-#     "Account": "RecordType.Name IN ('Parent Company','Brand','Dealer') AND IsPersonAccount = false",
-#     "Contact": "Account.RecordType.Name IN ('Parent Company','Brand','Dealer') AND Account.IsPersonAccount = false",
-#     "CollaborationGroup": "",
-#     "Impact_Tracker__c": "Clients_Brands__c!=null and Clients_Brands__r.RecordType.name in ('Parent Company','Brand','Dealer')",
-#     "Order": "RecordType.name in ('Field Win Win','Gift Card Procurement','Incentive')",
-#     "Request__c": "Brand__r.RecordType.name in ('Parent Company','Brand','Dealer') and Division__r.RecordType.name ='Brand Program')",
+#     "Request__c": "Id in (select Request__c from Request_Brand_Division__c where   Brand__r.RecordType.name in ('Parent Company','Brand','Dealer') and Division__r.RecordType.name ='Brand Program')"
+# }
+# OBJECT_CONDITIONS = {
 #     "ServiceAppointment": "",
 #     "User": "isActive = true",
 #     "WorkOrder": "Field_Win_Win__c IN (select id from order where  RecordType.name in ('Field Win Win','Gift Card Procurement','Incentive'))"
 # }
-OBJECT_CONDITIONS = {
-    "Account": "RecordType.Name IN ('Parent Company','Brand','Dealer') AND IsPersonAccount = false"
-}
 
 # --------------------------------------------------
 # Helpers
 # --------------------------------------------------
-def chunked(iterable: List[str], n: int) -> Iterable[List[str]]:
+def chunked(iterable: Iterable[Any], n: int) -> Generator[List[Any], None, None]:
+    iterable = list(iterable)  # convert to list so slicing works
     for i in range(0, len(iterable), n):
         yield iterable[i:i+n]
 
@@ -78,22 +85,29 @@ def safe_query_all(sf: Salesforce, soql: str):
             time.sleep(wait)
 
 
-def fetch_source_parent_ids(sf_source: Salesforce, obj: str, condition: str) -> List[str]:
+def fetch_source_parent_ids(sf_source: Salesforce,sf_target: Salesforce, obj: str, condition: str) -> List[str]:
      
     if obj == "ServiceAppointment":
         filtered_ids = set()
         filtered_ids=fetch_service_appointment_ids(sf_source)
         return filtered_ids
+    
+    if obj == "User":
+        user_ids = set()
+        user_ids = fetch_user_ids(sf_target)
+        ids_str= ",".join(f"'{uid}'" for uid in user_ids)
+        condition = f"Id IN ({ids_str}) AND {condition}" if condition else f"Id IN ({ids_str})"
+        
      
     if condition.strip():
         soql = f"SELECT Id FROM {obj} WHERE {condition}"
     else:
         soql = f"SELECT Id FROM {obj}"
-        
     logging.info(f"Fetching parent Ids from source for {obj} with condition: {condition or 'NO CONDITION'}")
     records = safe_query_all(sf_source, soql)
     ids = [r["Id"] for r in records]
     logging.info(f"Found {len(ids)} parent records for {obj}")
+    print(f"Found {len(ids)} parent records for {obj}")
     return ids
 
 
@@ -102,7 +116,7 @@ def fetch_cdls_for_parent_chunk(sf_source: Salesforce, parent_ids_chunk: List[st
     soql = f"""
         SELECT Id, ContentDocumentId, LinkedEntityId
         FROM ContentDocumentLink
-        WHERE ContentDocument.CreatedDate = TODAY AND LinkedEntityId IN ({ids_csv})
+        WHERE ContentDocument.CreatedDate >= LAST_N_MONTHS:24 AND LinkedEntityId IN ({ids_csv})
     """
     return safe_query_all(sf_source, soql)
 
@@ -127,20 +141,22 @@ def main():
     sf_source = connect_salesforce(SF_SOURCE)
     sf_target = connect_salesforce(SF_TARGET)
 
-    with open(OUTPUT_CSV, mode="w", newline="", encoding="utf-8") as csvfile:
+    with open(OUTPUT_CSV, mode="a", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow([
-            "Source_ContentDocumentLink_Id",
-            "ContentDocumentId",
-            "Source_Parent_Id",
-            "Target_Parent_Id",
-            "Parent_Object"
-        ])
+        # Only write header if file is new
+        if not file_exists:
+            writer.writerow([
+                "Source_ContentDocumentLink_Id",
+                "ContentDocumentId",
+                "Source_Parent_Id",
+                "Target_Parent_Id",
+                "Parent_Object"
+            ])
 
         total_rows = 0
 
         for obj, condition in OBJECT_CONDITIONS.items():
-            parent_ids = fetch_source_parent_ids(sf_source, obj, condition)
+            parent_ids = fetch_source_parent_ids(sf_source,sf_target, obj, condition)
             if not parent_ids:
                 logging.info(f"No parent records found for {obj}, skipping...")
                 continue

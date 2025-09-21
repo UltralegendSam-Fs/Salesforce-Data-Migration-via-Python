@@ -7,8 +7,7 @@ import re
 import os
 import pandas as pd
 from typing import Dict, List
-from bs4 import BeautifulSoup
-from mappings import fetch_createdByIds, build_owner_mapping, FILES_DIR
+from mappings import fetch_createdByIds, build_owner_mapping,related_recordid_mapping, FILES_DIR
 
 
 # === Tunables / Limits ===
@@ -64,66 +63,6 @@ def process_body(body: str) -> str:
     print("Original body:", body)
     #return re.body(r"<[^>]+>", "", body)
     return re.sub(r"<[^>]+>", "", body)
-
-def related_recordid_mapping(sf_source,sf_target,records,object_type):
-    doc_ids = set()
-    createdBy_ids = set()
-    createdBy_mappings = {}
-
-    createdBy_ids = {rec["CreatedById"] for rec in records if rec.get("CreatedById")}
-    createdBy_mappings = fetch_createdByIds(sf_target, createdBy_ids)
-
-
-    for rec in records:
-        rec["CreatedById"] = createdBy_mappings.get(rec.get("CreatedById"), None)
-        if object_type=="Comment":
-            body = rec.get("CommentBody") or ""
-        else:
-            body = rec.get("Body") or ""
-        matches = re.findall(r'<img[^>]+src="sfdc://([^"]+)"', body)
-        for doc_id in matches:
-            doc_ids.add(doc_id)
-
-    if not doc_ids:
-        print("⚠️ No <img> tags found in FeedItem bodies, skipping RelatedRecordId mapping")
-        return records  # return unchanged
-    
-    # Step 2: Fetch latest ContentVersion for all unique ContentDocumentIds
-    content_map = {}  # {ContentDocumentId: ContentVersionId}
-
-    if doc_ids:
-        ids_str = ",".join([f"'{d}'" for d in doc_ids])
-        ver_soql = f"""
-            SELECT ContentDocumentId, Id
-            FROM ContentVersion
-            WHERE ContentDocumentId IN ({ids_str}) AND IsLatest = true
-        """
-        ver_q = sf_source.query_all(ver_soql)["records"]
-        
-        for v in ver_q:
-            content_map[v["ContentDocumentId"]] = v["Id"]
-
-    # Step 3: Update each record with RelatedRecordId if image found
-    for rec in records:
-        if object_type=="Comment":
-            body = rec.get("CommentBody") or ""
-            new_body = re.sub(r'<img[^>]*>(?:</img>)?', '', body, flags=re.IGNORECASE)
-            rec["CommentBody"] = new_body.strip()
-
-        else:
-            body = rec.get("Body") or ""
-            new_body = re.sub(r'<img[^>]*>(?:</img>)?', '', body, flags=re.IGNORECASE)
-            rec["Body"] = new_body.strip()
-            
-        matches = re.findall(r'<img[^>]+src="sfdc://([^"]+)"', body)
-        if matches:
-            doc_id = matches[0]  # pick first if multiple
-            if doc_id in content_map:
-                rec["RelatedRecordId"] = content_map[doc_id]
-                
-                print(f"🔗 Mapped FeedItem {rec}")
-    return records
-
 
 def _bulk_insert_with_fallback(sf_target, sobject_name: str, records: List[Dict]):
     """

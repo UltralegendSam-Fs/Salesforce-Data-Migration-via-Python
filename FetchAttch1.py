@@ -7,7 +7,7 @@ from mappings import fetch_target_mappings,FILES_DIR
 
 # Objects with their filter conditions
 OBJECT_CONDITIONS = {
-    "Account": "RecordType.Name IN ('Parent Company','Brand','Dealer') AND IsPersonAccount = false",
+    "Account": "RecordType.Name IN ('Parent Company','Brand','Dealer') AND IsPersonAccount = false AND DE_Is_Shell_Account__c = false",
     "FSL__Optimization_Data__c ": ""
 }
 

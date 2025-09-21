@@ -13,6 +13,7 @@ Purpose:
 
 import csv
 import os
+import time
 from Auth_Cred.auth import connect_salesforce
 from Auth_Cred.config import SF_SOURCE, SF_TARGET
 from activity_config import TASK_FIELDS, EVENT_FIELDS
@@ -23,13 +24,26 @@ task_import_log = os.path.join(FILES_DIR, "task_import_log.csv")
 event_export = os.path.join(FILES_DIR, "event_export.csv")
 event_import_log = os.path.join(FILES_DIR, "event_import_log.csv")
 
-def fetch_records(sf, object_name, ids, fields):
-    """Fetch full Task/Event records from SOURCE org."""
-    soql = f"SELECT {', '.join(fields)} FROM {object_name} WHERE Id IN ({','.join([f"'{i}'" for i in ids])})"
-    print(f"[DEBUG] Fetching records: {soql}")
-    return sf.query_all(soql)["records"]
+# def fetch_records(sf, object_name, ids, fields):
+#     """Fetch full Task/Event records from SOURCE org."""
 
-def build_record(source_record, mapping_row, valid_fields, object_name, createdBy_mappings, owner_mappings):
+#     soql = f"SELECT {', '.join(fields)} FROM {object_name} WHERE Id IN ({','.join([f"'{i}'" for i in ids])})"
+#     print(f"[DEBUG] Fetching records: {soql}")
+#     return sf.query_all(soql)["records"]
+
+def fetch_records(sf, object_name, ids, fields, batch_size=200):
+    """Fetch full Task/Event records from SOURCE org in batches to avoid URI too long."""
+    records = []
+    for i in range(0, len(ids), batch_size):
+        batch_ids = ids[i:i+batch_size]
+        soql = f"SELECT {', '.join(fields)} FROM {object_name} WHERE Id IN ({','.join([f"'{id}'" for id in batch_ids])})"
+        print(f"[DEBUG] Fetching {object_name} batch {i//batch_size+1}: {soql}")
+        res = sf.query_all(soql)["records"]
+        records.extend(res)
+    return records
+
+
+def build_record(source_record, mapping_row, valid_fields, object_name,  owner_mappings):
     """Build record for insert into TARGET, remapping parents + special Request__c handling."""
     record = {}
 
@@ -69,15 +83,63 @@ def build_record(source_record, mapping_row, valid_fields, object_name, createdB
     if object_name == "Task":
         record["RecordTypeId"] = "0121K000001QPrPQAW"
     elif object_name == "Event":
-        record["RecordTypeId"] = "0124U0000015EnZQAU"
+        record["RecordTypeId"] = "0121K000001QProQAG"
 
     return record
+
+# def bulk_insert(sf_target, object_name, records, batch_size=200):
+#     results = []
+#     for i in range(0, len(records), batch_size):
+#         batch = records[i:i+batch_size]
+#         res = sf_target.bulk.__getattr__(object_name).insert(batch, batch_size=batch_size)
+#         results.extend(res)
+#     return results
+# import time
+
+def bulk_insert_with_retry(sf_target, object_name, records, batch_size=200, max_retries=3, retry_delay=5):
+    """
+    Insert records into Salesforce with retries for failed ones.
+    """
+    attempt = 1
+    all_results = []
+
+    # Work with a dynamic retry queue
+    to_retry = records
+
+    while attempt <= max_retries and to_retry:
+        print(f"[INFO] Attempt {attempt}: inserting {len(to_retry)} {object_name} records...")
+        results = []
+        for i in range(0, len(to_retry), batch_size):
+            batch = to_retry[i:i+batch_size]
+            res = sf_target.bulk.__getattr__(object_name).insert(batch, batch_size=batch_size)
+            results.extend(res)
+
+        all_results.extend(results)
+
+        # Collect failed records for retry
+        failed_records = []
+        for rec, res in zip(to_retry, results):
+            if not res["success"]:
+                failed_records.append(rec)
+
+        if failed_records:
+            print(f"[WARN] {len(failed_records)} {object_name} records failed in attempt {attempt}. Retrying...")
+            to_retry = failed_records
+            attempt += 1
+            time.sleep(retry_delay)  # wait before retry
+        else:
+            break  # no failures left
+
+    if to_retry:
+        print(f"[ERROR] {len(to_retry)} {object_name} records permanently failed after {max_retries} retries.")
+
+    return all_results
 
 
 def import_activities(sf_source, sf_target, object_name, fields, mapping_csv, log_csv):
     """Migrate Task/Event using mapping file."""
 
-    createdBy_mappings = {}
+    # createdBy_mappings = {}
 
     # Read mappings
     with open(mapping_csv, "r", encoding="utf-8") as f:
@@ -116,13 +178,24 @@ def import_activities(sf_source, sf_target, object_name, fields, mapping_csv, lo
                 "Errors": "Source record not found"
             })
             continue
+        # 🚨 Skip if both Target_WhatId and Target_WhoId are missing
+        if not m.get("Target_WhatId") and not m.get("Target_WhoId"):
+            logs.append({
+                "Source_Activity_Id": source_id,
+                "Target_Activity_Id": None,
+                "Success": False,
+                "Errors": "Skipped: No Target_WhatId or Target_WhoId"
+            })
+            continue
 
-        record = build_record(source_record, m, fields,object_name,createdBy_mappings,owner_mappings)
+        record = build_record(source_record, m, fields,object_name,owner_mappings)
         records_to_insert.append(record)
 
     # Bulk insert into TARGET
     print(f"[INFO] Inserting {len(records_to_insert)} {object_name} records into TARGET...")
-    results = sf_target.bulk.__getattr__(object_name).insert(records_to_insert, batch_size=200)
+    # results = bulk_insert(sf_target, object_name, records_to_insert, batch_size=200)
+    results = bulk_insert_with_retry(sf_target, object_name, records_to_insert, batch_size=200, max_retries=3, retry_delay=5)
+
 
     # Log results
     for m, res in zip(mappings, results):
@@ -142,6 +215,7 @@ def import_activities(sf_source, sf_target, object_name, fields, mapping_csv, lo
     failed = [l for l in logs if not l["Success"]]
     if failed:
         print(f"[ERROR] {len(failed)} failed inserts. Check {log_csv} for details.")
+        print("results:", res)
 
 
 def main():
@@ -159,14 +233,14 @@ def main():
     )
 
     # Import Events
-    import_activities(
-        sf_source=sf_source,
-        sf_target=sf_target,
-        object_name="Event",
-        fields=EVENT_FIELDS,
-        mapping_csv=event_export,
-        log_csv=event_import_log,
-    )
+    # import_activities(
+    #     sf_source=sf_source,
+    #     sf_target=sf_target,
+    #     object_name="Event",
+    #     fields=EVENT_FIELDS,
+    #     mapping_csv=event_export,
+    #     log_csv=event_import_log,
+    # )
 
 
 if __name__ == "__main__":
