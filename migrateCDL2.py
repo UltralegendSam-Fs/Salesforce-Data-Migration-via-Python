@@ -58,24 +58,55 @@ def read_mapping_file():
                     "Target_Parent_Id": row.get("Target_Parent_Id", "")
                 })
     return mappings
-
-
-def fetch_contentversions(sf: Salesforce, content_doc_ids):
-    """Fetch latest ContentVersion for given ContentDocumentIds."""
-    ids_csv = ",".join(f"'{cid}'" for cid in content_doc_ids)
-    soql = f"""
-        SELECT Id, ContentDocumentId, Title, PathOnClient
-        FROM ContentVersion
-        WHERE IsLatest = true
-        AND ContentDocumentId IN ({ids_csv})
+def fetch_contentversions(sf: Salesforce, content_doc_ids: set[str], batch_size: int = 500):
     """
-    return sf.query_all(soql)["records"]
+    Fetch latest ContentVersion for given ContentDocumentIds with batching.
+    """
+    if not content_doc_ids:
+        return []
+
+    content_doc_ids = list(content_doc_ids)
+    all_results = []
+
+    for i in range(0, len(content_doc_ids), batch_size):
+        batch = content_doc_ids[i : i + batch_size]
+        ids_csv = ",".join(f"'{cid}'" for cid in batch)
+
+        soql = f"""
+            SELECT Id, ContentDocumentId, Title, PathOnClient
+            FROM ContentVersion
+            WHERE IsLatest = true
+            AND ContentDocumentId IN ({ids_csv})
+        """
+
+        try:
+            results = sf.query_all(soql)["records"]
+            all_results.extend(results)
+            print(f"[DEBUG] Batch {i//batch_size+1}: fetched {len(results)} ContentVersions")
+        except Exception as e:
+            print(f"[ERROR] Failed fetching ContentVersions batch {i//batch_size+1}: {e}")
+            continue
+
+    print(f"[INFO] Fetched total {len(all_results)} ContentVersions")
+    return all_results
+
+
+# def fetch_contentversions(sf: Salesforce, content_doc_ids):
+#     """Fetch latest ContentVersion for given ContentDocumentIds."""
+#     ids_csv = ",".join(f"'{cid}'" for cid in content_doc_ids)
+#     soql = f"""
+#         SELECT Id, ContentDocumentId, Title, PathOnClient
+#         FROM ContentVersion
+#         WHERE IsLatest = true
+#         AND ContentDocumentId IN ({ids_csv})
+#     """
+#     return sf.query_all(soql)["records"]
 
 
 def download_file_as_base64(sf: Salesforce, version_id: str) -> str:
     """Download file binary from ContentVersion and return base64 string."""
     url = f"https://{sf.sf_instance}/services/data/{API_VERSION}/sobjects/ContentVersion/{version_id}/VersionData"
-    response = requests.get(url, headers={'Authorization': 'Bearer ' + sf.session_id}, stream=True)
+    response = sf.session.get(url, headers={'Authorization': 'Bearer ' + sf.session_id}, stream=True)
     response.raise_for_status()
     return base64.b64encode(response.content).decode("utf-8")
 
