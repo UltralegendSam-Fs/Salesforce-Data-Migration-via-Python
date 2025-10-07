@@ -15,15 +15,19 @@ import csv
 import re
 import logging
 import html
+from datetime import datetime
 from simple_salesforce import Salesforce
 from Auth_Cred.auth import connect_salesforce
 from Auth_Cred.config import SF_SOURCE, SF_TARGET
-from mappings import fetch_target_mappings, fetch_createdByIds,fetch_service_appointment_ids,related_recordid_mapping,FILES_DIR
+from utils.mappings import fetch_target_mappings, fetch_createdByIds,fetch_service_appointment_ids,related_recordid_mapping,FILES_DIR
+ 
+from utils.retry_utils import safe_query
 
 BATCH_SIZE = 200
 
 RESULT_FILE = os.path.join(FILES_DIR, "feeditem_results.csv")
 FEEDITEM_EXPORT = os.path.join(FILES_DIR, "feedItem_export.csv")
+FEEDITEM_INVALID = os.path.join(FILES_DIR, "feeditem_invalid.csv")
 LOG_FILE = os.path.join(FILES_DIR, "feeditem_migration.log")
 
 # === Logging Setup ===
@@ -60,7 +64,7 @@ def fetch_filtered_feeditems(sf_source,sf_target, obj_name, condition):
             sa_ids = fetch_service_appointment_ids(sf_source)
             parent_ids = sa_ids
         else:
-            parent_records = sf_source.query_all(soql)["records"]
+            parent_records = safe_query(sf_source, soql)["records"]
             parent_ids = {p["Id"] for p in parent_records}
         if not parent_ids:
             return []
@@ -68,7 +72,6 @@ def fetch_filtered_feeditems(sf_source,sf_target, obj_name, condition):
         # 🔹 SOQL IN clause has 2000 limit, so chunk
         feeditems = []
         parent_list = list(parent_ids)
-        print(f"Fetching FeedItems for {obj_name} with {len(parent_list)} parent IDs")
         for i in range(0, len(parent_list), 500):
             chunk = parent_list[i:i+500]
             ids_str = ",".join([f"'{pid}'" for pid in chunk])
@@ -77,13 +80,10 @@ def fetch_filtered_feeditems(sf_source,sf_target, obj_name, condition):
                 FROM FeedItem
                 WHERE ParentId IN ({ids_str})
             """
-            records = sf_source.query_all(query)["records"]
-            #print(f"query: {query}")
-            print(f"Fetched {len(records)} FeedItems")
+            records = safe_query(sf_source, query)["records"]
             records = related_recordid_mapping(sf_source,sf_target,records,"Item")
             feeditems.extend(records)
 
-        print(f"Fetched {len(feeditems)} FeedItems for {obj_name}")
         logging.info(f"Fetched {len(feeditems)} FeedItems for {obj_name}")
         return feeditems
 
@@ -91,19 +91,33 @@ def fetch_filtered_feeditems(sf_source,sf_target, obj_name, condition):
         logging.error(f"Error fetching FeedItems for {obj_name}: {e}")
         return []
 
-def insert_feeditems(sf_target, target_feeditems, results):
+def insert_feeditems_with_retry(sf_target, target_feeditems, results, max_retries=3, retry_delay=5):
     """
-    Insert FeedItems into target org in bulk.
+    Insert FeedItems into target org in bulk with retry logic.
     Appends success/failure results to the results list.
     """
+    import time
+    
     try:
-        print("Total FeedItems for insertion: ", len(target_feeditems))
-        insert_results = sf_target.bulk.FeedItem.insert([fi for *_, fi in target_feeditems])
-        print(f"Total FeedItems Inserted into Target: {len(insert_results)}")
+        
+        # Retry logic for bulk insert
+        insert_results = None
+        for attempt in range(max_retries):
+            try:
+                insert_results = sf_target.bulk.FeedItem.insert([fi for *_, fi in target_feeditems])
+                break  # Success, exit retry loop
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logging.error(f"FeedItem bulk insert failed after {max_retries} attempts: {e}")
+                    # Mark all records as failed
+                    insert_results = [{"success": False, "id": None, "errors": [str(e)]} for _ in target_feeditems]
+                else:
+                    logging.warning(f"FeedItem bulk insert attempt {attempt + 1} failed: {e}. Retrying...")
+                    time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+        
 
         for (src_id, src_parent, tgt_parent, _), ins_res in zip(target_feeditems, insert_results):
             if ins_res["success"]:
-                print(f"✅ Success: {ins_res.get('id')} for Source Id: {src_id}")
                 results.append({
                     "Source_FeedItem_Id": src_id,
                     "Target_FeedItem_Id": ins_res.get("id"),
@@ -121,6 +135,7 @@ def insert_feeditems(sf_target, target_feeditems, results):
                     "Status": f"Failed: {ins_res.get('errors')}"
                 })
     except Exception as e:
+        logging.error(f"FeedItem insertion failed: {e}")
         for src_id, src_parent, tgt_parent, _ in target_feeditems:
             results.append({
                 "Source_FeedItem_Id": src_id,
@@ -130,6 +145,10 @@ def insert_feeditems(sf_target, target_feeditems, results):
                 "Status": f"Failed: {str(e)}"
             })
     return results
+
+def insert_feeditems(sf_target, target_feeditems, results):
+    """Legacy function - now calls retry version"""
+    return insert_feeditems_with_retry(sf_target, target_feeditems, results)
 
 def migrate_feeditems(sf_source, sf_target):
     """Main migration loop"""
@@ -164,6 +183,7 @@ def migrate_feeditems(sf_source, sf_target):
     print(f"Total FeedItems collected: {len(all_feeditems)}")
 
     results = []
+    invalid_rows = []
 
     # Step 4: Prepare records for insertion
     for i in range(0, len(all_feeditems), BATCH_SIZE):
@@ -180,13 +200,12 @@ def migrate_feeditems(sf_source, sf_target):
             # Skip invalid cases
             if not tgt_parent or "status changed to" in feed_body.lower():
                 status = "Skipped - No Parent Mapping" if not tgt_parent else "Skipped - Invalid Body"
-                results.append({
-                    "Source_FeedItem_Id": record["Id"],
-                    "Target_FeedItem_Id": "",
-                    "Source_Parent_Id": src_parent,
-                    "Target_Parent_Id": tgt_parent or "",
-                    "Status": status
-                })
+                invalid_rows.append([
+                    record["Id"],
+                    src_parent,
+                    tgt_parent or "",
+                    status
+                ])
                 continue
 
             # Build insertable record
@@ -229,6 +248,13 @@ def migrate_feeditems(sf_source, sf_target):
 
         if target_feeditems:
             results = insert_feeditems(sf_target, target_feeditems, results)
+
+    # Write invalid rows CSV
+    if invalid_rows:
+        with open(FEEDITEM_INVALID, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Source_FeedItem_Id", "Source_Parent_Id", "Target_Parent_Id", "Reason"])
+            writer.writerows(invalid_rows)
 
     return results
 

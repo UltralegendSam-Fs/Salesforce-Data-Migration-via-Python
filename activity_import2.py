@@ -14,10 +14,25 @@ Purpose:
 import csv
 import os
 import time
+import logging
+from datetime import datetime
 from Auth_Cred.auth import connect_salesforce
 from Auth_Cred.config import SF_SOURCE, SF_TARGET
 from activity_config import TASK_FIELDS, EVENT_FIELDS
-from mappings import fetch_createdByIds, build_owner_mapping,FILES_DIR
+from utils.mappings import fetch_createdByIds, build_owner_mapping,get_record_type_id,FILES_DIR
+ 
+from utils.retry_utils import safe_query
+
+# Setup simple logging
+log_file = os.path.join(FILES_DIR, f"activity_import_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file),
+        logging.StreamHandler()
+    ]
+)
 
 task_export = os.path.join(FILES_DIR, "task_export.csv")     
 task_import_log = os.path.join(FILES_DIR, "task_import_log.csv")
@@ -38,12 +53,12 @@ def fetch_records(sf, object_name, ids, fields, batch_size=200):
         batch_ids = ids[i:i+batch_size]
         soql = f"SELECT {', '.join(fields)} FROM {object_name} WHERE Id IN ({','.join([f"'{id}'" for id in batch_ids])})"
         print(f"[DEBUG] Fetching {object_name} batch {i//batch_size+1}: {soql}")
-        res = sf.query_all(soql)["records"]
+        res = safe_query(sf, soql)["records"]
         records.extend(res)
     return records
 
 
-def build_record(source_record, mapping_row, valid_fields, object_name,  owner_mappings):
+def build_record(sf_target, source_record, mapping_row, valid_fields, object_name, owner_mappings, validator=None):
     """Build record for insert into TARGET, remapping parents + special Request__c handling."""
     record = {}
 
@@ -69,32 +84,23 @@ def build_record(source_record, mapping_row, valid_fields, object_name,  owner_m
         if mapping_row["Source_WhatId"].startswith("a19"):  # Example: Request__c prefix is "a0X"
             record["Request__c"] = tgt_what
     
-    # 🔹 Map CreatedById using createdBy_mappings
-    # src_createdBy = source_record.get("CreatedById")
-    # if src_createdBy and src_createdBy in createdBy_mappings:
-    #     record["CreatedById"] = createdBy_mappings[src_createdBy]
-    
     # 🔹 Map OwnerId using owner_mappings
     src_owner = source_record.get("OwnerId")
     if src_owner and src_owner in owner_mappings:
         record["OwnerId"] = owner_mappings[src_owner]
 
-    # 🔹 Hardcode RecordTypeId for Task/Event
-    if object_name == "Task":
-        record["RecordTypeId"] = "0121K000001QPrPQAW"
-    elif object_name == "Event":
-        record["RecordTypeId"] = "0121K000001QProQAG"
+    # 🔹 Get RecordTypeId dynamically
+    try:
+        if object_name == "Task":
+            record["RecordTypeId"] = get_record_type_id(sf_target, object_name, "Task")
+        elif object_name == "Event":
+            record["RecordTypeId"] = get_record_type_id(sf_target, object_name, "Event_0")
+    except Exception as e:
+        print(f"Warning: Could not resolve RecordType for {object_name}: {e}")
+        # Continue without RecordType if resolution fails
 
     return record
 
-# def bulk_insert(sf_target, object_name, records, batch_size=200):
-#     results = []
-#     for i in range(0, len(records), batch_size):
-#         batch = records[i:i+batch_size]
-#         res = sf_target.bulk.__getattr__(object_name).insert(batch, batch_size=batch_size)
-#         results.extend(res)
-#     return results
-# import time
 
 def bulk_insert_with_retry(sf_target, object_name, records, batch_size=200, max_retries=3, retry_delay=5):
     """
@@ -109,10 +115,18 @@ def bulk_insert_with_retry(sf_target, object_name, records, batch_size=200, max_
     while attempt <= max_retries and to_retry:
         print(f"[INFO] Attempt {attempt}: inserting {len(to_retry)} {object_name} records...")
         results = []
-        for i in range(0, len(to_retry), batch_size):
-            batch = to_retry[i:i+batch_size]
-            res = sf_target.bulk.__getattr__(object_name).insert(batch, batch_size=batch_size)
-            results.extend(res)
+        
+        try:
+            for i in range(0, len(to_retry), batch_size):
+                batch = to_retry[i:i+batch_size]
+                res = sf_target.bulk.__getattr__(object_name).insert(batch, batch_size=batch_size)
+                results.extend(res)
+        except Exception as e:
+            print(f"[ERROR] Bulk insert failed: {e}")
+            # Mark all records as failed
+            for rec in to_retry:
+                all_results.append({"success": False, "id": None, "errors": [str(e)]})
+            return all_results
 
         all_results.extend(results)
 
@@ -137,9 +151,7 @@ def bulk_insert_with_retry(sf_target, object_name, records, batch_size=200, max_
 
 
 def import_activities(sf_source, sf_target, object_name, fields, mapping_csv, log_csv):
-    """Migrate Task/Event using mapping file."""
-
-    # createdBy_mappings = {}
+    """Migrate Task/Event using mapping file with progress tracking (no validation)."""
 
     # Read mappings
     with open(mapping_csv, "r", encoding="utf-8") as f:
@@ -154,9 +166,6 @@ def import_activities(sf_source, sf_target, object_name, fields, mapping_csv, lo
     # Fetch full records from SOURCE
     print(f"[INFO] Fetching {len(source_ids)} {object_name} records from SOURCE...")
     source_records = fetch_records(sf_source, object_name, source_ids, fields)
-
-    # createdBy_ids = {fi["CreatedById"] for fi in source_records}
-    # createdBy_mappings = fetch_createdByIds(sf_target, createdBy_ids)
     
     ownerIds = {fi["OwnerId"] for fi in source_records}
     owner_mappings = build_owner_mapping(sf_source, sf_target, ownerIds)
@@ -188,13 +197,33 @@ def import_activities(sf_source, sf_target, object_name, fields, mapping_csv, lo
             })
             continue
 
-        record = build_record(source_record, m, fields,object_name,owner_mappings)
-        records_to_insert.append(record)
+        record = build_record(sf_target, source_record, m, fields, object_name, owner_mappings, validator=None)
+        if record:
+            records_to_insert.append(record)
+            
+        else:
+            logs.append({
+                "Source_Activity_Id": source_id,
+                "Target_Activity_Id": None,
+                "Success": False,
+                "Errors": "Record build failed"
+            })
 
-    # Bulk insert into TARGET
-    print(f"[INFO] Inserting {len(records_to_insert)} {object_name} records into TARGET...")
-    # results = bulk_insert(sf_target, object_name, records_to_insert, batch_size=200)
-    results = bulk_insert_with_retry(sf_target, object_name, records_to_insert, batch_size=200, max_retries=3, retry_delay=5)
+    # Bulk insert into TARGET with progress tracking
+    if records_to_insert:
+        print(f"[INFO] Inserting {len(records_to_insert)} {object_name} records into TARGET...")
+        
+        # Perform bulk insert with retries
+        # results = bulk_insert(sf_target, object_name, records_to_insert, batch_size=200)
+        results = bulk_insert_with_retry(sf_target, object_name, records_to_insert, batch_size=200, max_retries=3, retry_delay=5)
+
+        # Count successful inserts
+        successful = sum(1 for r in results if r.get("success", False))
+    else:
+        print(f"[WARN] No valid records to insert for {object_name}")
+        results = []
+        successful = 0
+    print(f"[PROGRESS] {successful}/{len(records_to_insert)} records processed successfully")
 
 
     # Log results
@@ -211,14 +240,30 @@ def import_activities(sf_source, sf_target, object_name, fields, mapping_csv, lo
         writer.writeheader()
         writer.writerows(logs)
 
-    print(f"[INFO] Inserted {sum(1 for l in logs if l['Success'])}/{len(logs)} {object_name} records.")
-    failed = [l for l in logs if not l["Success"]]
-    if failed:
-        print(f"[ERROR] {len(failed)} failed inserts. Check {log_csv} for details.")
-        print("results:", res)
+    # Calculate and display summary statistics
+    total_records = len(logs)
+    successful_records = sum(1 for l in logs if l['Success'])
+    failed_records = total_records - successful_records
+    success_rate = (successful_records / total_records * 100) if total_records > 0 else 0
+    
+    print(f"[SUMMARY] {object_name} Migration Complete:")
+    print(f"  Total records: {total_records}")
+    print(f"  Successful: {successful_records}")
+    print(f"  Failed: {failed_records}")
+    print(f"  Success rate: {success_rate:.1f}%")
+    
+    if failed_records > 0:
+        print(f"[ERROR] {failed_records} failed inserts. Check {log_csv} for details.")
+        # Show first few errors
+        failed = [l for l in logs if not l["Success"]]
+        for i, fail in enumerate(failed[:3]):  # Show first 3 errors
+            print(f"  Error {i+1}: {fail.get('Errors', 'Unknown error')}")
+        if len(failed) > 3:
+            print(f"  ... and {len(failed) - 3} more errors")
 
 
 def main():
+    
     sf_source = connect_salesforce(SF_SOURCE)
     sf_target = connect_salesforce(SF_TARGET)
 

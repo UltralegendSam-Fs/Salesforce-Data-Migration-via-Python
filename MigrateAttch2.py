@@ -5,7 +5,8 @@ import logging
 import requests
 from Auth_Cred.config import SF_SOURCE, SF_TARGET   # ← imported instead of redefining
 from Auth_Cred.auth import connect_salesforce                     # ← imported instead of redefining
-from mappings import FILES_DIR
+from utils.mappings import FILES_DIR
+from utils.retry_utils import safe_query
 BATCH_LOG_INTERVAL = 50  # Log after every 50 uploads
 
 LOG_FILE = os.path.join(FILES_DIR, "migration.log")

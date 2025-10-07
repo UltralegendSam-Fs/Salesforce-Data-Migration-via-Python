@@ -9,11 +9,15 @@ import csv
 import os
 import logging
 import pandas as pd
+from datetime import datetime
 from Auth_Cred.auth import connect_salesforce
 from Auth_Cred.config import SF_SOURCE, SF_TARGET
-from mappings import fetch_target_mappings,fetch_createdByIds,fetch_service_appointment_ids,FILES_DIR
+from utils.mappings import fetch_target_mappings,fetch_createdByIds,fetch_service_appointment_ids,FILES_DIR
+ 
+from utils.retry_utils import safe_query
 
 EM_export = os.path.join(FILES_DIR, "eventMessage_export.csv")     
+EM_invalid = os.path.join(FILES_DIR, "eventMessage_invalid.csv")     
 EM_import = os.path.join(FILES_DIR, "eventMessage_import.csv")     
 emailtemplate_mapping = os.path.join(FILES_DIR, "emailtemplate_mapping.csv")
 log_file = os.path.join(FILES_DIR, "emailmessage_migration.log")
@@ -40,11 +44,11 @@ def fetch_em_records(sf):
     query = """
         SELECT Id,ParentId,TextBody, HtmlBody,ActivityId,Headers,Subject,FromName,FromAddress,ValidatedFromAddress,ToAddress,CcAddress,BccAddress,Incoming,Status,MessageDate,ReplyToEmailMessageId,MessageIdentifier,ThreadIdentifier,ClientThreadIdentifier,FromId,IsClientManaged,AttachmentIds,RelatedToId, RelatedTo.Type,IsTracked,FirstOpenedDate,LastOpenedDate,IsBounced,EmailTemplateId,EmailRoutingAddressId,AutomationType
         FROM EmailMessage
-        WHERE CreatedDate >= LAST_N_MONTHS:24 AND RelatedToId != NULL
+        WHERE CreatedDate = TODAY AND RelatedToId != NULL
         AND RelatedTo.Type IN ('Impact_Tracker__c','ServiceAppointment')
     """
     logging.info("[DEBUG] Fetching EmailMessages...")
-    email_results = sf.query_all(query)
+    email_results = safe_query(sf, query)
     emails = email_results["records"]
     print(f"[DEBUG] Found {len(emails)} EmailMessages")
 
@@ -76,7 +80,7 @@ def fetch_em_records(sf):
                 ids_str = ",".join([f"'{i}'" for i in chunk])
                 query = f"SELECT Id FROM {obj_name} WHERE Id IN ({ids_str}) AND {cond}"
                 logging.info(f"[DEBUG] Fetching {obj_name} with condition: {cond} (batch {len(chunk)})")
-                res = sf.query_all(query)
+                res = safe_query(sf, query)
                 valid_parent_ids.update([r["Id"] for r in res["records"]])
                 print(f"[DEBUG] Found {len(res['records'])} valid {obj_name} records")
 
@@ -131,11 +135,12 @@ def fetch_target_ids(sf_target, records):
     
     return records
 
-def insert_emailmessages(sf_target, object_name, prepared_records, skipped_records, batch_size=200):
+def insert_emailmessages_with_retry(sf_target, object_name, prepared_records, skipped_records, batch_size=200, max_retries=3, retry_delay=5):
     """
-    Insert EmailMessage records into target org in chunks.
+    Insert EmailMessage records into target org in chunks with retry logic.
     Logs results and writes them into EM_import file.
     """
+    import time
 
     with open(EM_import, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -146,15 +151,30 @@ def insert_emailmessages(sf_target, object_name, prepared_records, skipped_recor
             logging.warning(f"Skipped {sid}: {reason}")
             writer.writerow([sid, "", "Skipped", reason])
 
-        # --- Insert prepared records in batches ---
+        # --- Insert prepared records in batches with retry ---
         for i in range(0, len(prepared_records), batch_size):
             batch = prepared_records[i:i + batch_size]
             source_ids = [sid for sid, _ in batch]
             objs = [obj for _, obj in batch]
 
             print(f"[INFO] Inserting batch {i//batch_size + 1} with {len(batch)} records...")
-            results = sf_target.bulk.__getattr__(object_name).insert(objs, batch_size=batch_size)
+            
+            # Retry logic for each batch
+            results = None
+            for attempt in range(max_retries):
+                try:
+                    results = sf_target.bulk.__getattr__(object_name).insert(objs, batch_size=batch_size)
+                    break  # Success, exit retry loop
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        logging.error(f"Batch {i//batch_size + 1} failed after {max_retries} attempts: {e}")
+                        # Mark all records in this batch as failed
+                        results = [{"success": False, "id": None, "errors": [str(e)]} for _ in batch]
+                    else:
+                        logging.warning(f"Batch {i//batch_size + 1} attempt {attempt + 1} failed: {e}. Retrying...")
+                        time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
 
+            # Process results
             for sid, res in zip(source_ids, results):
                 errors = res.get("errors", [])
                 if not errors:
@@ -170,6 +190,10 @@ def insert_emailmessages(sf_target, object_name, prepared_records, skipped_recor
 
     logging.info(f"[INFO] Migration complete. Inserted {len(prepared_records)} records, skipped {len(skipped_records)}.")
     logging.info(f"[INFO] Results saved to {EM_import}")
+
+def insert_emailmessages(sf_target, object_name, prepared_records, skipped_records, batch_size=200):
+    """Legacy function - now calls retry version"""
+    return insert_emailmessages_with_retry(sf_target, object_name, prepared_records, skipped_records, batch_size)
 
 def export_activity(sf_source, sf_target, object_name, batch_size=200):
     """Main export function for EM."""
@@ -202,106 +226,56 @@ def export_activity(sf_source, sf_target, object_name, batch_size=200):
 
         prepared_records.append((rec["Id"], insert_data))
 
-    # --- Export mapping for audit ---
+    # --- Separate records based on Target_RelatedToId availability ---
+    valid_records = []
+    invalid_records = []
+    
+    for rec in em_records:
+        if rec.get("Target_RelatedToId"):
+            valid_records.append(rec)
+        else:
+            invalid_records.append(rec)
+    
+    # --- Export valid records (with Target_RelatedToId) ---
     with open(EM_export, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
         header = ["Source_EM_Id", "Source_RelatedId", "Source_FromId",
                   "Target_FromId", "Target_RelatedToId", "Target_EmailTemplateId"]
         writer.writerow(header)
-        for rec in em_records:
+        for rec in valid_records:
+            writer.writerow([
+                rec["Id"], rec.get("RelatedToId", ""), rec.get("FromId", ""),
+                rec.get("Target_FromId", ""), rec.get("Target_RelatedToId", ""),
+                rec.get("Target_EmailTemplateId", "")
+            ])
+    
+    # --- Export invalid records (without Target_RelatedToId) ---
+    with open(EM_invalid, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        header = ["Source_EM_Id", "Source_RelatedId", "Source_FromId",
+                  "Target_FromId", "Target_RelatedToId", "Target_EmailTemplateId"]
+        writer.writerow(header)
+        for rec in invalid_records:
             writer.writerow([
                 rec["Id"], rec.get("RelatedToId", ""), rec.get("FromId", ""),
                 rec.get("Target_FromId", ""), rec.get("Target_RelatedToId", ""),
                 rec.get("Target_EmailTemplateId", "")
             ])
 
-    print(f"[SUCCESS] Prepared {len(prepared_records)} records, skipped {len(skipped_records)} → {EM_export}")
+    # --- Log the results ---
+    logging.info(f"[INFO] Total EmailMessage records processed: {len(em_records)}")
+    logging.info(f"[INFO] Valid records (with Target_RelatedToId): {len(valid_records)} → {EM_export}")
+    logging.info(f"[INFO] Invalid records (without Target_RelatedToId): {len(invalid_records)} → {EM_invalid}")
+    logging.info(f"[INFO] Prepared for insertion: {len(prepared_records)} records")
+    logging.info(f"[INFO] Skipped records: {len(skipped_records)}")
+    
+    print(f"[SUCCESS] Prepared {len(prepared_records)} records, skipped {len(skipped_records)}")
+    print(f"[SUCCESS] Valid records (with Target_RelatedToId): {len(valid_records)} → {EM_export}")
+    print(f"[SUCCESS] Invalid records (without Target_RelatedToId): {len(invalid_records)} → {EM_invalid}")
 
     # --- Insert records using the new method ---
     insert_emailmessages(sf_target, object_name, prepared_records, skipped_records, batch_size)
 
-
-# def export_activity(sf_source, sf_target, object_name, batch_size=200):
-#     """Main export function for EM."""
-
-#     prepared_records = []
-#     skipped_records = []
-#     em_records = fetch_em_records(sf_source)
-#     em_records = fetch_target_ids(sf_target, em_records)
-
-#     for rec in em_records:
-#         # Skip if parent or email template mapping is missing
-#         if not rec.get("Target_RelatedToId"):
-#             skipped_records.append((rec["Id"], "No mapped parent"))
-#             continue
-#         if rec.get("EmailTemplateId") and not rec.get("Target_EmailTemplateId"):
-#             skipped_records.append((rec["Id"], "Unmapped EmailTemplate"))
-#             continue
-
-#         insert_data = rec.copy()
-#         insert_data["FromId"] = rec["Target_FromId"]
-#         insert_data["RelatedToId"] = rec["Target_RelatedToId"]
-#         insert_data["EmailTemplateId"] = rec["Target_EmailTemplateId"]
-#         insert_data["status"] = "5"  # Sent
-#         insert_data["Card_Legacy_Id__c"] = rec["Id"]  # Custom field to track legacy ID
-
-#         # Remove non-insertable fields
-#         # Headers, AttachmentIds, FirstOpenedDate, LastOpenedDate
-#         for f in ["Id", "ActivityId", "RelatedTo", "Target_FromId", "Target_RelatedToId",
-#                   "Target_EmailTemplateId", "ValidatedFromAddress"]:
-#             insert_data.pop(f, None)
-
-#         prepared_records.append((rec["Id"], insert_data))
-
-#     # --- Export mapping for audit ---
-#     with open(EM_export, "w", newline="", encoding="utf-8") as csvfile:
-#         writer = csv.writer(csvfile)
-#         header = ["Source_EM_Id", "Source_RelatedId", "Source_FromId",
-#                   "Target_FromId", "Target_RelatedToId", "Target_EmailTemplateId"]
-#         writer.writerow(header)
-#         for rec in em_records:
-#             writer.writerow([
-#                 rec["Id"], rec.get("RelatedToId", ""), rec.get("FromId", ""),
-#                 rec.get("Target_FromId", ""), rec.get("Target_RelatedToId", ""),
-#                 rec.get("Target_EmailTemplateId", "")
-#             ])
-
-#     print(f"[SUCCESS] Prepared {len(prepared_records)} records, skipped {len(skipped_records)} → {EM_export}")
-
-#     # --- Insert in chunks ---
-#     with open(EM_import, "w", newline="", encoding="utf-8") as f:
-#         writer = csv.writer(f)
-#         writer.writerow(["Source_Activity_Id", "Target_Activity_Id", "Success", "Errors"])
-
-#         # Write skipped first
-#         for sid, reason in skipped_records:
-#             logging.warning(f"Skipped {sid}: {reason}")
-#             writer.writerow([sid, "", "Skipped", reason])
-
-#         # Insert in chunks of batch_size
-#         for i in range(0, len(prepared_records), batch_size):
-#             batch = prepared_records[i:i + batch_size]
-#             source_ids = [sid for sid, _ in batch]
-#             objs = [obj for _, obj in batch]
-
-#             print(f"[INFO] Inserting batch {i//batch_size + 1} with {len(batch)} records...")
-#             results = sf_target.bulk.__getattr__(object_name).insert(objs, batch_size=batch_size)
-
-#             for sid, res in zip(source_ids, results):
-#                 errors = res.get("errors", [])
-#                 if not errors:
-#                     writer.writerow([sid, res.get("id", ""), True, ""])
-#                 else:
-#                     error_msgs = []
-#                     for e in errors:
-#                         if isinstance(e, dict):
-#                             error_msgs.append(e.get("message", str(e)))
-#                         else:
-#                             error_msgs.append(str(e))
-#                     writer.writerow([sid, "", False, ";".join(error_msgs)])
-
-#     logging.info(f"[INFO] Migration complete. Inserted {len(prepared_records)} records, skipped {len(skipped_records)}.")
-#     logging.info(f"[INFO] Results saved to {EM_import}")
 
 if __name__ == "__main__":
     sf_source = connect_salesforce(SF_SOURCE)

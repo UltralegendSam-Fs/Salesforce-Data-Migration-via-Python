@@ -4,8 +4,9 @@ stream_contentdocumentlink_mapping.py
 
 Purpose:
   - Stream ContentDocumentLink records from SOURCE org constrained by OBJECT_CONDITIONS.
+  - Fetch ALL ContentDocumentLinks for documents (including user shares) to preserve document sharing.
   - Map LinkedEntityId -> target record Id using Card_Legacy_Id__c in TARGET org.
-  - Write mapping rows to CSV: Source_ContentDocumentLink_Id, ContentDocumentId, Source_Parent_Id, Target_Parent_Id
+  - Write mapping rows to CSV: Source_ContentDocumentLink_Id, ContentDocumentId, Source_Parent_Id, Target_Parent_Id, Parent_Object, ShareType, Visibility
 
 Notes:
   - For large volumes we use chunked processing and CSV streaming.
@@ -21,10 +22,13 @@ from simple_salesforce import Salesforce
 from Auth_Cred.auth import connect_salesforce
 from Auth_Cred.config import SF_SOURCE, SF_TARGET
 from typing import Dict,Iterable, List, Generator, Any
-from mappings import FILES_DIR, fetch_service_appointment_ids,fetch_user_ids
+from utils.mappings import FILES_DIR, fetch_service_appointment_ids,fetch_user_ids
+from utils.retry_utils import safe_query
 
 OUTPUT_CSV = os.path.join(FILES_DIR, "contentdocumentlink_mapping.csv")
 file_exists = os.path.exists(OUTPUT_CSV)
+UNMATCHED_CSV = os.path.join(FILES_DIR, "contentdocumentlink_unmatched.csv")
+unmatched_exists = os.path.exists(UNMATCHED_CSV)
 LOG_FILE = os.path.join(FILES_DIR, "contentdocumentlink_mapping.log")
 
 # === Logging configuration ===
@@ -40,20 +44,19 @@ SLEEP_BETWEEN_RETRIES = 2
 MAX_RETRIES = 5
 
 # === Object Conditions ===
-OBJECT_CONDITIONS = {
-    "Account": "RecordType.Name IN ('Parent Company','Brand','Dealer') AND IsPersonAccount = false AND DE_Is_Shell_Account__c = false ",
-    "Contact": "Account.RecordType.Name IN ('Parent Company','Brand','Dealer') AND Account.IsPersonAccount = false",
-    "Impact_Tracker__c": "Clients_Brands__c!=null and Clients_Brands__r.RecordType.name in ('Parent Company','Brand','Dealer')",
-    "Order": "RecordType.name in ('Field Win Win','Gift Card Procurement','Incentive') AND Account.recordtype.name IN  ('Parent Company','Brand','Dealer')",
-    "Request__c": "Id in (select Request__c from Request_Brand_Division__c where   Brand__r.RecordType.name in ('Parent Company','Brand','Dealer') and Division__r.RecordType.name ='Brand Program')",
-    "ServiceAppointment": "",
-    "User": "isActive = true",
-    "WorkOrder": "Field_Win_Win__c IN (select id from order where  RecordType.name in ('Field Win Win','Gift Card Procurement','Incentive') AND Account.recordtype.name IN ('Parent Company','Brand','Dealer'))"
-}
-
 # OBJECT_CONDITIONS = {
-#     "Request__c": "Id in (select Request__c from Request_Brand_Division__c where   Brand__r.RecordType.name in ('Parent Company','Brand','Dealer') and Division__r.RecordType.name ='Brand Program')"
+#     "Account": "RecordType.Name IN ('Parent Company','Brand','Dealer') AND IsPersonAccount = false AND DE_Is_Shell_Account__c = false ",
+#     "Contact": "Account.RecordType.Name IN ('Parent Company','Brand','Dealer') AND Account.IsPersonAccount = false",
+#     "Impact_Tracker__c": "Clients_Brands__c!=null and Clients_Brands__r.RecordType.name in ('Parent Company','Brand','Dealer')",
+#     "Order": "RecordType.name in ('Field Win Win','Gift Card Procurement','Incentive') AND Account.recordtype.name IN  ('Parent Company','Brand','Dealer')",
+#     "Request__c": "Id in (select Request__c from Request_Brand_Division__c where   Brand__r.RecordType.name in ('Parent Company','Brand','Dealer') and Division__r.RecordType.name ='Brand Program')",
+#     "ServiceAppointment": "",
+#     "WorkOrder": "Field_Win_Win__c IN (select id from order where  RecordType.name in ('Field Win Win','Gift Card Procurement','Incentive') AND Account.recordtype.name IN ('Parent Company','Brand','Dealer'))"
 # }
+
+OBJECT_CONDITIONS = {
+    "Account": "RecordType.Name IN ('Parent Company','Brand','Dealer') AND IsPersonAccount = false AND DE_Is_Shell_Account__c = false "
+}
 # OBJECT_CONDITIONS = {
 #     "ServiceAppointment": "",
 #     "User": "isActive = true",
@@ -74,7 +77,7 @@ def safe_query_all(sf: Salesforce, soql: str):
     while True:
         try:
             logging.debug(f"Executing SOQL: {soql}")
-            return sf.query_all(soql).get("records", [])
+            return safe_query(sf, soql).get("records", [])
         except Exception as e:
             attempt += 1
             if attempt > MAX_RETRIES:
@@ -112,18 +115,57 @@ def fetch_source_parent_ids(sf_source: Salesforce,sf_target: Salesforce, obj: st
 
 
 def fetch_cdls_for_parent_chunk(sf_source: Salesforce, parent_ids_chunk: List[str]) -> List[Dict]:
+    """Fetch ContentDocumentLinks for parent entities, then fetch ALL links for those documents"""
     ids_csv = ",".join(f"'{pid}'" for pid in parent_ids_chunk)
-    soql = f"""
-        SELECT Id, ContentDocumentId, LinkedEntityId
+    
+    # First, get ContentDocumentLinks for the parent entities
+    parent_soql = f"""
+        SELECT Id, ContentDocumentId, LinkedEntityId, ShareType, Visibility
         FROM ContentDocumentLink
-        WHERE ContentDocument.CreatedDate >= LAST_N_MONTHS:24 AND LinkedEntityId IN ({ids_csv})
+        WHERE ContentDocument.CreatedDate = TODAY AND LinkedEntityId IN ({ids_csv})
     """
-    return safe_query_all(sf_source, soql)
+    parent_links = safe_query_all(sf_source, parent_soql)
+    # print(f"Parent links: {parent_soql}")
+
+    if not parent_links:
+        return []
+    
+    # Extract unique ContentDocumentIds from parent links
+    content_doc_ids = list(set([link["ContentDocumentId"] for link in parent_links]))
+    
+    # Now fetch ALL ContentDocumentLinks for these documents (including user shares)
+    doc_ids_csv = ",".join(f"'{doc_id}'" for doc_id in content_doc_ids)
+    all_links_soql = f"""
+        SELECT Id, ContentDocumentId, LinkedEntityId, ShareType, Visibility, LinkedEntity.Type
+        FROM ContentDocumentLink
+        WHERE ContentDocumentId IN ({doc_ids_csv})
+    """
+    
+    all_links = safe_query_all(sf_source, all_links_soql)
+    logging.info(f"Found {len(parent_links)} parent links and {len(all_links)} total links (including user shares)")
+    
+    return all_links
 
 
 def build_target_map_for_chunk(sf_target: Salesforce, obj: str, source_parent_chunk: List[str]) -> Dict[str, str]:
     ids_csv = ",".join(f"'{sid}'" for sid in source_parent_chunk)
     soql = f"SELECT Id, Card_Legacy_Id__c FROM {obj} WHERE Card_Legacy_Id__c IN ({ids_csv})"
+    records = safe_query_all(sf_target, soql)
+    mapping = {}
+    for r in records:
+        legacy = r.get("Card_Legacy_Id__c")
+        if legacy:
+            mapping[legacy] = r["Id"]
+    return mapping
+
+
+def build_user_target_map(sf_target: Salesforce, source_user_ids: List[str]) -> Dict[str, str]:
+    """Build mapping for Users from source to target org"""
+    if not source_user_ids:
+        return {}
+    
+    ids_csv = ",".join(f"'{uid}'" for uid in source_user_ids)
+    soql = f"SELECT Id, Card_Legacy_Id__c FROM User WHERE Card_Legacy_Id__c IN ({ids_csv})"
     records = safe_query_all(sf_target, soql)
     mapping = {}
     for r in records:
@@ -141,8 +183,10 @@ def main():
     sf_source = connect_salesforce(SF_SOURCE)
     sf_target = connect_salesforce(SF_TARGET)
 
-    with open(OUTPUT_CSV, mode="a", newline="", encoding="utf-8") as csvfile:
+    with open(OUTPUT_CSV, mode="a", newline="", encoding="utf-8") as csvfile, \
+         open(UNMATCHED_CSV, mode="a", newline="", encoding="utf-8") as unmatched_csvfile:
         writer = csv.writer(csvfile)
+        unmatched_writer = csv.writer(unmatched_csvfile)
         # Only write header if file is new
         if not file_exists:
             writer.writerow([
@@ -150,7 +194,19 @@ def main():
                 "ContentDocumentId",
                 "Source_Parent_Id",
                 "Target_Parent_Id",
-                "Parent_Object"
+                "Parent_Object",
+                "ShareType",
+                "Visibility"
+            ])
+        if not unmatched_exists:
+            unmatched_writer.writerow([
+                "Source_ContentDocumentLink_Id",
+                "ContentDocumentId",
+                "Source_Parent_Id",
+                "Target_Parent_Id",
+                "Parent_Object",
+                "ShareType",
+                "Visibility"
             ])
 
         total_rows = 0
@@ -179,6 +235,23 @@ def main():
                     logging.info(f"No ContentDocumentLinks found for {obj} chunk {chunk_idx}")
                     continue
 
+                # Separate parent entity links from user links
+                parent_links = []
+                user_links = []
+                user_ids = set()
+                
+                for link in cdls:
+                    linked_entity_type = link.get("LinkedEntity", {}).get("Type", "Unknown")
+                    if linked_entity_type == "User":
+                        user_links.append(link)
+                        user_ids.add(link.get("LinkedEntityId"))
+                    elif link.get("LinkedEntityId") in parent_chunk:
+                        parent_links.append(link)
+
+                logging.info(f"[{obj}] chunk {chunk_idx}: Found {len(parent_links)} parent links and {len(user_links)} user shares")
+                print(f"[INFO] [{obj}] chunk {chunk_idx}: Found {len(parent_links)} parent links and {len(user_links)} user shares")
+
+                # Build target mappings for both parent entities and users
                 try:
                     target_map = build_target_map_for_chunk(sf_target, obj, parent_chunk)
                 except Exception as e:
@@ -186,15 +259,53 @@ def main():
                     print(f"[ERROR] Failed to query target mapping for {obj} chunk {chunk_idx}: {e}")
                     target_map = {}
 
-                for link in cdls:
+                try:
+                    user_target_map = build_user_target_map(sf_target, list(user_ids))
+                except Exception as e:
+                    logging.error(f"Failed to query user target mapping for chunk {chunk_idx}: {e}")
+                    print(f"[ERROR] Failed to query user target mapping for chunk {chunk_idx}: {e}")
+                    user_target_map = {}
+
+                # Process parent entity links
+                for link in parent_links:
                     src_cdl_id = link.get("Id")
                     content_doc_id = link.get("ContentDocumentId")
                     src_parent_id = link.get("LinkedEntityId")
+                    share_type = link.get("ShareType") 
+                    # If Sharetype is I then set to V
+                    if share_type == "I":
+                        share_type = "V"
+                    visibility = link.get("Visibility")
+                    
                     tgt_parent_id = target_map.get(src_parent_id)
-                    writer.writerow([src_cdl_id, content_doc_id, src_parent_id, tgt_parent_id, obj])
+
+                    if tgt_parent_id:
+                        writer.writerow([src_cdl_id, content_doc_id, src_parent_id, tgt_parent_id, obj, share_type, visibility])
+                    else:
+                        unmatched_writer.writerow([src_cdl_id, content_doc_id, src_parent_id, "", obj, share_type, visibility])
+                    total_rows += 1
+
+                # Process user links
+                for link in user_links:
+                    src_cdl_id = link.get("Id")
+                    content_doc_id = link.get("ContentDocumentId")
+                    src_user_id = link.get("LinkedEntityId")
+                    share_type = link.get("ShareType")
+                     # If Sharetype is I then set to V
+                    if share_type == "I":
+                        share_type = "V"
+                    visibility = link.get("Visibility")
+                    
+                    tgt_user_id = user_target_map.get(src_user_id)
+
+                    if tgt_user_id:
+                        writer.writerow([src_cdl_id, content_doc_id, src_user_id, tgt_user_id, "User", share_type, visibility])
+                    else:
+                        unmatched_writer.writerow([src_cdl_id, content_doc_id, src_user_id, "", "User", share_type, visibility])
                     total_rows += 1
 
                 csvfile.flush()
+                unmatched_csvfile.flush()
 
                 if chunk_idx % 10 == 0:
                     logging.info(f"Processed {chunk_idx} chunks for {obj}... total rows so far: {total_rows}")

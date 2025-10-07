@@ -12,10 +12,13 @@ Purpose:
 import csv
 import os
 import re
+from datetime import datetime
 from simple_salesforce import Salesforce
 from Auth_Cred.auth import connect_salesforce
 from Auth_Cred.config import SF_SOURCE, SF_TARGET
-from mappings import fetch_target_mappings, fetch_createdByIds,related_recordid_mapping, FILES_DIR
+from utils.mappings import fetch_target_mappings, fetch_createdByIds,related_recordid_mapping, FILES_DIR
+ 
+from utils.retry_utils import safe_query
 
 BATCH_SIZE = 200
 SOQL_SIZE = 500
@@ -45,23 +48,22 @@ def fetch_feedcomments(sf_source: Salesforce,sf_target: Salesforce, feeditem_ids
         """
 
         try:
-            results = sf_source.query_all(query)["records"]
+            results = safe_query(sf_source, query)["records"]
             all_results.extend(results)
-            print(f"[DEBUG] Batch {i//SOQL_SIZE+1}: fetched {len(results)} FeedComments")
         except Exception as e:
             print(f"[ERROR] Failed fetching FeedComments batch {i//SOQL_SIZE+1}: {e}")
             continue
 
-    print(f"[INFO] Fetched total {len(all_results)} FeedComments from source org")
 
     # Apply mapping once on all collected results
     all_results = related_recordid_mapping(sf_source,sf_target, all_results,"Comment")
     return all_results
 
-def insert_feedcomments(sf: Salesforce, comments, feeditem_mapping):
+def insert_feedcomments_with_retry(sf: Salesforce, comments, feeditem_mapping, max_retries=3, retry_delay=5):
     inserted_ids = []
     records_to_insert = []
     record_pairs = []  # [(source_comment, new_comment)]
+    import time
 
     related_ids = {c["RelatedRecordId"] for c in comments if c.get("RelatedRecordId")}
     relatedId_mappings = fetch_target_mappings(sf, "ContentVersion", related_ids, BATCH_SIZE)
@@ -95,25 +97,39 @@ def insert_feedcomments(sf: Salesforce, comments, feeditem_mapping):
         except Exception as e:
             inserted_ids.append((c["Id"], None, c["FeedItemId"], None, f"Prep Error: {str(e)}"))
 
-    # Insert in chunks
-    print(f"[INFO] Prepared FeedComment {len(records_to_insert)} for insertion")
+    # Insert in chunks with retry logic
     for i in range(0, len(records_to_insert), BATCH_SIZE):
         batch = records_to_insert[i:i+BATCH_SIZE]
         src_batch = [p[0] for p in record_pairs[i:i+BATCH_SIZE]]
-        results = sf.bulk.FeedComment.insert(batch)
         
+        # Retry logic for each batch
+        results = None
+        for attempt in range(max_retries):
+            try:
+                results = sf.bulk.FeedComment.insert(batch)
+                break  # Success, exit retry loop
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    print(f"[ERROR] FeedComment batch {i//BATCH_SIZE + 1} failed after {max_retries} attempts: {e}")
+                    # Mark all records in this batch as failed
+                    results = [{"success": False, "id": None, "errors": [str(e)]} for _ in batch]
+                else:
+                    print(f"[WARN] FeedComment batch {i//BATCH_SIZE + 1} attempt {attempt + 1} failed: {e}. Retrying...")
+                    time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
 
         for c, res in zip(src_batch, results):
             if res.get("success"):
-                print(f"[INFO] Inserted FeedComment {c['Id']} as {res.get('id')}")
                 inserted_ids.append((c["Id"], res.get("id"), c["FeedItemId"], feeditem_mapping.get(c["FeedItemId"]), "Success"))
             else:
                 msg = f"Failed: {res.get('errors')}"
                 print(f"[ERROR] FeedComment {c['Id']} failed → {msg}")
                 inserted_ids.append((c["Id"], None, c["FeedItemId"], feeditem_mapping.get(c["FeedItemId"]), msg))
 
-    print(f"[INFO] Inserted {len(inserted_ids)} FeedComments into target org")
     return inserted_ids
+
+def insert_feedcomments(sf: Salesforce, comments, feeditem_mapping):
+    """Legacy function - now calls retry version"""
+    return insert_feedcomments_with_retry(sf, comments, feeditem_mapping)
 
 # === Main Migration Process ===
 def migrate_feedcomments(sf_source, sf_target):

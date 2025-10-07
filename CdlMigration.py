@@ -18,11 +18,12 @@ import logging
 import re
 import requests
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from simple_salesforce import Salesforce
 from Auth_Cred.auth import connect_salesforce
 from Auth_Cred.config import SF_SOURCE, SF_TARGET
-from mappings import FILES_DIR
+from utils.mappings import FILES_DIR
 
 INPUT_MAPPING_FILE = os.path.join(FILES_DIR, "contentdocumentlink_mapping.csv")
 OUTPUT_VERSION_MAPPING_FILE = os.path.join(FILES_DIR, "contentversion_migration_mapping.csv")
@@ -41,6 +42,7 @@ API_VERSION = "v59.0"
 MAX_RETRIES = 5
 RETRY_SLEEP_SECS = 2
 REST_MAX_SIZE_BYTES = 50 * 1024 * 1024  # ~50MB REST limit
+MAX_WORKERS = 5  # parallel threads for download/upload
 
 INVALID_FS_CHARS = re.compile(r'[:<>"/\\|?*\x00-\x1F]')
 
@@ -167,6 +169,95 @@ def create_cdl(sf_target: Salesforce, new_doc_id: str, parent_id: str, share_typ
     sf_target.ContentDocumentLink.create(payload)
 
 # -----------------------------
+# Worker for parallel processing
+# -----------------------------
+def migrate_one_document(sf_source: Salesforce,
+                         sf_target: Salesforce,
+                         cdid: str,
+                         version: dict,
+                         rows_for_doc: list[dict],
+                         link_meta: dict) -> list[dict]:
+    results: list[dict] = []
+
+    if not version:
+        log_and_print(f"[WARN] No latest ContentVersion found for ContentDocumentId={cdid}; skipping upload", "warning")
+        return results
+
+    old_ver_id = version["Id"]
+    old_doc_id = version["ContentDocumentId"]
+    title = (version.get("Title") or "file").strip() or "file"
+    path_on_client = sanitize_path(title, version.get("PathOnClient"))
+    size_bytes = int(version.get("ContentSize") or 0)
+
+    if size_bytes > REST_MAX_SIZE_BYTES:
+        log_and_print(
+            f"[ERROR] {old_doc_id} latest version {old_ver_id} is {size_bytes} bytes (>50MB). "
+            f"Skipping REST upload. Implement multipart/resumable for large files.", "error"
+        )
+        return results
+
+    try:
+        file_b64 = download_file_as_base64(sf_source, old_ver_id)
+    except Exception as e:
+        log_and_print(f"[ERROR] Failed to download VersionData {old_ver_id}: {e}", "error")
+        return results
+
+    new_ver_id = ""
+    new_doc_id = ""
+    try:
+        create_resp = sf_target.ContentVersion.create({
+            "Title": title,
+            "PathOnClient": path_on_client,
+            "VersionData": file_b64,
+            "Card_Legacy_Id__c": old_ver_id
+        })
+        new_ver_id = create_resp["id"]
+        new_ver = sf_target.ContentVersion.get(new_ver_id)
+        new_doc_id = new_ver["ContentDocumentId"]
+        log_and_print(f"✅ Uploaded {old_ver_id} → {new_ver_id} (doc {old_doc_id} → {new_doc_id})")
+    except Exception as e:
+        log_and_print(f"[ERROR] Failed to create ContentVersion for {old_ver_id}: {e}", "error")
+        return results
+
+    # Create links for all requested target parents
+    for m in rows_for_doc:
+        target_parent_id = m.get("Target_Parent_Id")
+        if not target_parent_id:
+            results.append({
+                "Old_ContentVersionId": old_ver_id,
+                "Old_ContentDocumentId": old_doc_id,
+                "New_ContentVersionId": new_ver_id or "",
+                "New_ContentDocumentId": new_doc_id or "",
+                "Target_Parent_Id": ""
+            })
+            continue
+
+        share_type = m.get("ShareType")
+        visibility = m.get("Visibility")
+
+        if not (share_type and visibility):
+            src_parent = m.get("Source_Parent_Id")
+            meta = link_meta.get((cdid, src_parent), {}) if src_parent else {}
+            share_type = share_type or meta.get("ShareType") or "V"
+            visibility = visibility or meta.get("Visibility") or "AllUsers"
+
+        try:
+            create_cdl(sf_target, new_doc_id, target_parent_id, share_type, visibility)
+            log_and_print(f"🔗 Linked {new_doc_id} → {target_parent_id} (ShareType={share_type}, Visibility={visibility})")
+        except Exception as e:
+            log_and_print(f"[ERROR] Failed linking {new_doc_id} → {target_parent_id}: {e}", "error")
+
+        results.append({
+            "Old_ContentVersionId": old_ver_id,
+            "Old_ContentDocumentId": old_doc_id,
+            "New_ContentVersionId": new_ver_id or "",
+            "New_ContentDocumentId": new_doc_id or "",
+            "Target_Parent_Id": target_parent_id or ""
+        })
+
+    return results
+
+# -----------------------------
 # Main migration
 # -----------------------------
 def migrate_versions(sf_source, sf_target, map_rows):
@@ -189,102 +280,32 @@ def migrate_versions(sf_source, sf_target, map_rows):
                 missing_meta_pairs.add((cdid, r["Source_Parent_Id"]))
     link_meta = fetch_link_meta_bulk(sf_source, missing_meta_pairs) if missing_meta_pairs else {}
 
-    new_doc_by_old_doc = {}  # old ContentDocumentId -> new ContentDocumentId
-    new_ver_by_old_ver = {}  # old ContentVersionId  -> new ContentVersionId
-
-    # Iterate by chunks of docs (to throttle downloads/uploads)
+    # Iterate by chunks of docs (to throttle) and process each chunk in parallel
     doc_ids = list(by_doc.keys())
     for c in range(0, len(doc_ids), CHUNK_SIZE):
         doc_chunk = doc_ids[c:c+CHUNK_SIZE]
         log_and_print(f"[INFO] Processing doc chunk {c//CHUNK_SIZE + 1}/{math.ceil(len(doc_ids)/CHUNK_SIZE)} ({len(doc_chunk)} docs)")
 
-        for cdid in doc_chunk:
-            version = latest_by_doc.get(cdid)
-            if not version:
-                log_and_print(f"[WARN] No latest ContentVersion found for ContentDocumentId={cdid}; skipping upload", "warning")
-                continue
-
-            old_ver_id = version["Id"]
-            old_doc_id = version["ContentDocumentId"]
-            title = (version.get("Title") or "file").strip() or "file"
-            path_on_client = sanitize_path(title, version.get("PathOnClient"))
-            size_bytes = int(version.get("ContentSize") or 0)
-
-            # Upload once per document
-            if old_doc_id not in new_doc_by_old_doc:
-                if size_bytes > REST_MAX_SIZE_BYTES:
-                    log_and_print(
-                        f"[ERROR] {old_doc_id} latest version {old_ver_id} is {size_bytes} bytes (>50MB). "
-                        f"Skipping REST upload. Implement multipart/resumable for large files.", "error"
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = []
+            for cdid in doc_chunk:
+                version = latest_by_doc.get(cdid)
+                futures.append(
+                    executor.submit(
+                        migrate_one_document,
+                        sf_source,
+                        sf_target,
+                        cdid,
+                        version,
+                        by_doc[cdid],
+                        link_meta,
                     )
-                    continue
+                )
 
-                try:
-                    file_b64 = download_file_as_base64(sf_source, old_ver_id)
-                except Exception as e:
-                    log_and_print(f"[ERROR] Failed to download VersionData {old_ver_id}: {e}", "error")
-                    continue
-
-                try:
-                    create_resp = sf_target.ContentVersion.create({
-                        "Title": title,
-                        "PathOnClient": path_on_client,
-                        "VersionData": file_b64,
-                        "Card_Legacy_Id__c": old_ver_id  # optional traceability
-                    })
-                    new_ver_id = create_resp["id"]
-                    # Fetch ContentDocumentId of the new version
-                    new_ver = sf_target.ContentVersion.get(new_ver_id)
-                    new_doc_id = new_ver["ContentDocumentId"]
-
-                    new_ver_by_old_ver[old_ver_id] = new_ver_id
-                    new_doc_by_old_doc[old_doc_id] = new_doc_id
-
-                    log_and_print(f"✅ Uploaded {old_ver_id} → {new_ver_id} (doc {old_doc_id} → {new_doc_id})")
-                except Exception as e:
-                    log_and_print(f"[ERROR] Failed to create ContentVersion for {old_ver_id}: {e}", "error")
-                    continue
-            else:
-                new_doc_id = new_doc_by_old_doc[old_doc_id]
-                new_ver_id = new_ver_by_old_ver.get(old_ver_id)  # may be None if created in a different chunk, but not critical
-
-            # Create ALL requested links to target parents for this document
-            for m in by_doc[cdid]:
-                target_parent_id = m.get("Target_Parent_Id")
-                if not target_parent_id:
-                    # row without a target parent mapping — record result but no link
-                    results.append({
-                        "Old_ContentVersionId": old_ver_id,
-                        "Old_ContentDocumentId": old_doc_id,
-                        "New_ContentVersionId": new_ver_id or "",
-                        "New_ContentDocumentId": new_doc_id or "",
-                        "Target_Parent_Id": ""
-                    })
-                    continue
-
-                share_type = m.get("ShareType")
-                visibility = m.get("Visibility")
-
-                if not (share_type and visibility):
-                    # Try source lookup if we have Source_Parent_Id
-                    src_parent = m.get("Source_Parent_Id")
-                    meta = link_meta.get((cdid, src_parent), {}) if src_parent else {}
-                    share_type = share_type or meta.get("ShareType") or "V"
-                    visibility = visibility or meta.get("Visibility") or "AllUsers"
-
-                try:
-                    create_cdl(sf_target, new_doc_id, target_parent_id, share_type, visibility)
-                    log_and_print(f"🔗 Linked {new_doc_id} → {target_parent_id} (ShareType={share_type}, Visibility={visibility})")
-                except Exception as e:
-                    log_and_print(f"[ERROR] Failed linking {new_doc_id} → {target_parent_id}: {e}", "error")
-
-                results.append({
-                    "Old_ContentVersionId": old_ver_id,
-                    "Old_ContentDocumentId": old_doc_id,
-                    "New_ContentVersionId": new_ver_id or "",
-                    "New_ContentDocumentId": new_doc_id or "",
-                    "Target_Parent_Id": target_parent_id
-                })
+            for f in as_completed(futures):
+                doc_results = f.result() or []
+                if doc_results:
+                    results.extend(doc_results)
 
     return results
 
