@@ -27,7 +27,7 @@ BATCH_SIZE = 200
 
 RESULT_FILE = os.path.join(FILES_DIR, "feeditem_results.csv")
 FEEDITEM_EXPORT = os.path.join(FILES_DIR, "feedItem_export.csv")
-FEEDITEM_INVALID = os.path.join(FILES_DIR, "feeditem_invalid.csv")
+FEEDITEM_INVALID = os.path.join(FILES_DIR, "feedItem_invalid.csv")
 LOG_FILE = os.path.join(FILES_DIR, "feeditem_migration.log")
 
 # === Logging Setup ===
@@ -39,17 +39,16 @@ logging.basicConfig(
 
 
 # === Object Conditions ===
-# OBJECT_CONDITIONS = {
-#     "Impact_Tracker__c": "Clients_Brands__c!=null and Clients_Brands__r.RecordType.name in ('Parent Company','Brand','Dealer')",
-#     "Order": " RecordType.name in ('Field Win Win','Gift Card Procurement','Incentive')",
-#     "ServiceAppointment": "",
-#     "User": "IsActive =true",
-#     "WorkOrder": "Field_Win_Win__c IN (select id from order where  RecordType.name in ('Field Win Win','Gift Card Procurement','Incentive'))"
-# }
-
 OBJECT_CONDITIONS = {
-    "Account": "RecordType.Name IN ('Parent Company','Brand','Dealer') AND IsPersonAccount = false AND DE_Is_Shell_Account__c = false"
+    "Account": "RecordType.Name IN ('Parent Company','Brand','Dealer') AND IsPersonAccount = false AND DE_Is_Shell_Account__c = false",
+    "Impact_Tracker__c": "Clients_Brands__c!=null and Clients_Brands__r.RecordType.name in ('Parent Company','Brand','Dealer')",
+    "Order": " RecordType.name in ('Field Win Win','Gift Card Procurement','Incentive')",
+    "ServiceAppointment": "",
+    "User": "IsActive =true",
+    "WorkOrder": "Field_Win_Win__c IN (select id from order where  RecordType.name in ('Field Win Win','Gift Card Procurement','Incentive'))"
 }
+
+
 
     
 def fetch_filtered_feeditems(sf_source,sf_target, obj_name, condition):
@@ -78,7 +77,7 @@ def fetch_filtered_feeditems(sf_source,sf_target, obj_name, condition):
             query = f"""
                 SELECT Id, ParentId, Body, LinkUrl, Type, RelatedRecordId,CreatedById, CreatedDate,IsRichText,Visibility,Title
                 FROM FeedItem
-                WHERE ParentId IN ({ids_str})
+                WHERE CreatedDate >= LAST_N_MONTHS:12 AND Type IN ('TextPost','ContentPost','LinkPost','QuestionPost') AND ParentId IN ({ids_str})
             """
             records = safe_query(sf_source, query)["records"]
             records = related_recordid_mapping(sf_source,sf_target,records,"Item")
@@ -183,7 +182,7 @@ def migrate_feeditems(sf_source, sf_target):
     print(f"Total FeedItems collected: {len(all_feeditems)}")
 
     results = []
-    invalid_rows = []
+    invalid_row = []
 
     # Step 4: Prepare records for insertion
     for i in range(0, len(all_feeditems), BATCH_SIZE):
@@ -200,12 +199,7 @@ def migrate_feeditems(sf_source, sf_target):
             # Skip invalid cases
             if not tgt_parent or "status changed to" in feed_body.lower():
                 status = "Skipped - No Parent Mapping" if not tgt_parent else "Skipped - Invalid Body"
-                invalid_rows.append([
-                    record["Id"],
-                    src_parent,
-                    tgt_parent or "",
-                    status
-                ])
+                invalid_row.append([record["Id"], src_parent, tgt_parent or "", status])
                 continue
 
             # Build insertable record
@@ -249,13 +243,13 @@ def migrate_feeditems(sf_source, sf_target):
         if target_feeditems:
             results = insert_feeditems(sf_target, target_feeditems, results)
 
-    # Write invalid rows CSV
-    if invalid_rows:
-        with open(FEEDITEM_INVALID, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["Source_FeedItem_Id", "Source_Parent_Id", "Target_Parent_Id", "Reason"])
-            writer.writerows(invalid_rows)
-
+    # Write invalid rows to a separate CSV
+    if invalid_row:
+        with open(FEEDITEM_INVALID, "w", newline="", encoding="utf-8") as finv:
+            writer = csv.writer(finv)
+            writer.writerow(["Source_FeedItem_Id", "Source_Parent_Id", "Target_Parent_Id", "Status"])
+            writer.writerows(invalid_row)
+            
     return results
 
 def write_results(results):

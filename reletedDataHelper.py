@@ -114,13 +114,8 @@ def migrate_attachments(sf_source, sf_target, src_activity_ids: List[str], activ
         
         total_attachments += len(valid_attachments)
         
-        createdBy_ids = set()
-        createdBy_mappings = {}
         owner_ids = set()
         owner_mappings = {}
-
-        # createdBy_ids = {att["CreatedById"] for att in valid_attachments if att.get("CreatedById")}
-        # createdBy_mappings = fetch_createdByIds(sf_target, createdBy_ids)
 
         owner_ids = {att["OwnerId"] for att in valid_attachments if att.get("OwnerId")}
         owner_mappings = build_owner_mapping(sf_source, sf_target, owner_ids)
@@ -156,9 +151,6 @@ def migrate_attachments(sf_source, sf_target, src_activity_ids: List[str], activ
                 if att.get("ContentType"):
                     payload["ContentType"] = att["ContentType"]
 
-                # optional: remap CreatedById and OwnerId if present
-                # if att.get("CreatedById") and att["CreatedById"] in createdBy_mappings:
-                #     payload["CreatedById"] = createdBy_mappings[att["CreatedById"]]
                 if att.get("OwnerId") and att["OwnerId"] in owner_mappings:
                     payload["OwnerId"] = owner_mappings[att["OwnerId"]]
 
@@ -190,10 +182,6 @@ def migrate_attachments(sf_source, sf_target, src_activity_ids: List[str], activ
 
 # ---------------------------
 # Migration: Files (ContentDocument / ContentVersion / ContentDocumentLink)
-# ---------------------------
-
-# ---------------------------
-# Migration: Files (ContentDocumentLink only, no ContentVersion upload)
 # ---------------------------
 
 def reset_file_migration_cache():

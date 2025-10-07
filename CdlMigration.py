@@ -150,7 +150,7 @@ def fetch_link_meta_bulk(sf: Salesforce, pairs):
 # -----------------------------
 def download_file_as_base64(sf: Salesforce, version_id: str) -> str:
     url = f"https://{sf.sf_instance}/services/data/{API_VERSION}/sobjects/ContentVersion/{version_id}/VersionData"
-    resp = requests.get(url, headers={'Authorization': 'Bearer ' + sf.session_id}, stream=True, timeout=300)
+    resp = sf.session.get(url, headers={'Authorization': 'Bearer ' + sf.session_id}, stream=True, timeout=300)
     resp.raise_for_status()
     return base64.b64encode(resp.content).decode("utf-8")
 

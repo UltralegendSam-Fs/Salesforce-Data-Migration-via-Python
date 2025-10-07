@@ -39,12 +39,6 @@ task_import_log = os.path.join(FILES_DIR, "task_import_log.csv")
 event_export = os.path.join(FILES_DIR, "event_export.csv")
 event_import_log = os.path.join(FILES_DIR, "event_import_log.csv")
 
-# def fetch_records(sf, object_name, ids, fields):
-#     """Fetch full Task/Event records from SOURCE org."""
-
-#     soql = f"SELECT {', '.join(fields)} FROM {object_name} WHERE Id IN ({','.join([f"'{i}'" for i in ids])})"
-#     print(f"[DEBUG] Fetching records: {soql}")
-#     return sf.query_all(soql)["records"]
 
 def fetch_records(sf, object_name, ids, fields, batch_size=200):
     """Fetch full Task/Event records from SOURCE org in batches to avoid URI too long."""
@@ -52,13 +46,14 @@ def fetch_records(sf, object_name, ids, fields, batch_size=200):
     for i in range(0, len(ids), batch_size):
         batch_ids = ids[i:i+batch_size]
         soql = f"SELECT {', '.join(fields)} FROM {object_name} WHERE Id IN ({','.join([f"'{id}'" for id in batch_ids])})"
-        print(f"[DEBUG] Fetching {object_name} batch {i//batch_size+1}: {soql}")
+        print(f"[DEBUG] Fetching {object_name} batch {i//batch_size+1}")
         res = safe_query(sf, soql)["records"]
+        print(f"[DEBUG] Retrieved {len(res)} records")
         records.extend(res)
     return records
 
 
-def build_record(sf_target, source_record, mapping_row, valid_fields, object_name, owner_mappings, validator=None):
+def build_record(sf_target, source_record, mapping_row, valid_fields, object_name, owner_mappings,recordTypeId):
     """Build record for insert into TARGET, remapping parents + special Request__c handling."""
     record = {}
 
@@ -90,14 +85,8 @@ def build_record(sf_target, source_record, mapping_row, valid_fields, object_nam
         record["OwnerId"] = owner_mappings[src_owner]
 
     # 🔹 Get RecordTypeId dynamically
-    try:
-        if object_name == "Task":
-            record["RecordTypeId"] = get_record_type_id(sf_target, object_name, "Task")
-        elif object_name == "Event":
-            record["RecordTypeId"] = get_record_type_id(sf_target, object_name, "Event_0")
-    except Exception as e:
-        print(f"Warning: Could not resolve RecordType for {object_name}: {e}")
-        # Continue without RecordType if resolution fails
+    if recordTypeId:
+        record["RecordTypeId"] = recordTypeId
 
     return record
 
@@ -152,6 +141,10 @@ def bulk_insert_with_retry(sf_target, object_name, records, batch_size=200, max_
 
 def import_activities(sf_source, sf_target, object_name, fields, mapping_csv, log_csv):
     """Migrate Task/Event using mapping file with progress tracking (no validation)."""
+    if object_name == "Task":
+        recordTypeId = get_record_type_id(sf_target, object_name, "Event_0")
+    elif object_name == "Event":
+        recordTypeId = get_record_type_id(sf_target, object_name, "Task")
 
     # Read mappings
     with open(mapping_csv, "r", encoding="utf-8") as f:
@@ -166,12 +159,14 @@ def import_activities(sf_source, sf_target, object_name, fields, mapping_csv, lo
     # Fetch full records from SOURCE
     print(f"[INFO] Fetching {len(source_ids)} {object_name} records from SOURCE...")
     source_records = fetch_records(sf_source, object_name, source_ids, fields)
+    print(f"[INFO] Fetched {len(source_records)} {object_name} records from SOURCE.")
     
     ownerIds = {fi["OwnerId"] for fi in source_records}
     owner_mappings = build_owner_mapping(sf_source, sf_target, ownerIds)
 
     # Index by Id for quick lookup
     source_map = {rec["Id"]: rec for rec in source_records}
+    print(f"[INFO] Built source record map with {len(source_map)} entries.")
 
     # Prepare records for insert
     records_to_insert, logs = [], []
@@ -197,7 +192,8 @@ def import_activities(sf_source, sf_target, object_name, fields, mapping_csv, lo
             })
             continue
 
-        record = build_record(sf_target, source_record, m, fields, object_name, owner_mappings, validator=None)
+        record = build_record(sf_target, source_record, m, fields, object_name, owner_mappings,recordTypeId)
+        print(f"[DEBUG] Built record for Source_Activity_Id {source_id}")
         if record:
             records_to_insert.append(record)
             
@@ -278,14 +274,14 @@ def main():
     )
 
     # Import Events
-    # import_activities(
-    #     sf_source=sf_source,
-    #     sf_target=sf_target,
-    #     object_name="Event",
-    #     fields=EVENT_FIELDS,
-    #     mapping_csv=event_export,
-    #     log_csv=event_import_log,
-    # )
+    import_activities(
+        sf_source=sf_source,
+        sf_target=sf_target,
+        object_name="Event",
+        fields=EVENT_FIELDS,
+        mapping_csv=event_export,
+        log_csv=event_import_log,
+    )
 
 
 if __name__ == "__main__":

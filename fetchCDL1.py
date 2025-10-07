@@ -44,19 +44,19 @@ SLEEP_BETWEEN_RETRIES = 2
 MAX_RETRIES = 5
 
 # === Object Conditions ===
-# OBJECT_CONDITIONS = {
-#     "Account": "RecordType.Name IN ('Parent Company','Brand','Dealer') AND IsPersonAccount = false AND DE_Is_Shell_Account__c = false ",
-#     "Contact": "Account.RecordType.Name IN ('Parent Company','Brand','Dealer') AND Account.IsPersonAccount = false",
-#     "Impact_Tracker__c": "Clients_Brands__c!=null and Clients_Brands__r.RecordType.name in ('Parent Company','Brand','Dealer')",
-#     "Order": "RecordType.name in ('Field Win Win','Gift Card Procurement','Incentive') AND Account.recordtype.name IN  ('Parent Company','Brand','Dealer')",
-#     "Request__c": "Id in (select Request__c from Request_Brand_Division__c where   Brand__r.RecordType.name in ('Parent Company','Brand','Dealer') and Division__r.RecordType.name ='Brand Program')",
-#     "ServiceAppointment": "",
-#     "WorkOrder": "Field_Win_Win__c IN (select id from order where  RecordType.name in ('Field Win Win','Gift Card Procurement','Incentive') AND Account.recordtype.name IN ('Parent Company','Brand','Dealer'))"
-# }
-
 OBJECT_CONDITIONS = {
-    "Account": "RecordType.Name IN ('Parent Company','Brand','Dealer') AND IsPersonAccount = false AND DE_Is_Shell_Account__c = false "
+    "Account": "RecordType.Name IN ('Parent Company','Brand','Dealer') AND IsPersonAccount = false AND DE_Is_Shell_Account__c = false ",
+    "Contact": "Account.RecordType.Name IN ('Parent Company','Brand','Dealer') AND Account.IsPersonAccount = false",
+    "Impact_Tracker__c": "Clients_Brands__c!=null and Clients_Brands__r.RecordType.name in ('Parent Company','Brand','Dealer')",
+    "Order": "RecordType.name in ('Field Win Win','Gift Card Procurement','Incentive') AND Account.recordtype.name IN  ('Parent Company','Brand','Dealer')",
+    "Request__c": "Id in (select Request__c from Request_Brand_Division__c where   Brand__r.RecordType.name in ('Parent Company','Brand','Dealer') and Division__r.RecordType.name ='Brand Program')",
+    "ServiceAppointment": "",
+    "WorkOrder": "Field_Win_Win__c IN (select id from order where  RecordType.name in ('Field Win Win','Gift Card Procurement','Incentive') AND Account.recordtype.name IN ('Parent Company','Brand','Dealer'))"
 }
+
+# OBJECT_CONDITIONS = {
+#     "Request__c": "Id in (select Request__c from Request_Brand_Division__c where   Brand__r.RecordType.name in ('Parent Company','Brand','Dealer') and Division__r.RecordType.name ='Brand Program')"
+# }
 # OBJECT_CONDITIONS = {
 #     "ServiceAppointment": "",
 #     "User": "isActive = true",
@@ -122,11 +122,10 @@ def fetch_cdls_for_parent_chunk(sf_source: Salesforce, parent_ids_chunk: List[st
     parent_soql = f"""
         SELECT Id, ContentDocumentId, LinkedEntityId, ShareType, Visibility
         FROM ContentDocumentLink
-        WHERE ContentDocument.CreatedDate = TODAY AND LinkedEntityId IN ({ids_csv})
+        WHERE ContentDocument.CreatedDate >= LAST_N_MONTHS:24 AND LinkedEntityId IN ({ids_csv})
     """
     parent_links = safe_query_all(sf_source, parent_soql)
-    # print(f"Parent links: {parent_soql}")
-
+    
     if not parent_links:
         return []
     

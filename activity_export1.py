@@ -161,14 +161,7 @@ def export_activity(sf_source, sf_target, object_name, output_file, batch_size=2
             tgt_what = parent_mappings.get(src_what) if src_what else ""
             tgt_who = parent_mappings.get(src_who) if src_who else ""
 
-            # Mark as unmatched if:
-            # - either source has an ID but mapping is missing, OR
-            # - both target mappings are empty (covers when both source IDs are null or both failed to map)
-            is_unmatched = (
-                (src_what and not tgt_what)
-                or (src_who and not tgt_who)
-                or (not tgt_what and not tgt_who)
-            )
+            is_unmatched = (src_what and not tgt_what) or (src_who and not tgt_who) or (not tgt_what and not tgt_who )
 
             if is_unmatched:
                 unmatched_writer.writerow([src_id, src_what, tgt_what, src_who, tgt_who, src_type])
@@ -193,7 +186,7 @@ if __name__ == "__main__":
 
         # Run for both Task and Event
         export_activity(sf_source, sf_target, "Task", task_export)
-        #export_activity(sf_source, sf_target, "Event", event_export)
+        export_activity(sf_source, sf_target, "Event", event_export)
         
         logger.info("Activity export process completed successfully")
     except Exception as e:

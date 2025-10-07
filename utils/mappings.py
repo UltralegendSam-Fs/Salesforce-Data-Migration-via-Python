@@ -1,6 +1,9 @@
 import os
 import re
 from utils.retry_utils import safe_query
+from dotenv import load_dotenv
+
+load_dotenv()  # Load environment variables from .env file
 
 def fetch_target_mappings(sf, object_name, source_parent_ids, batch_size):
     """Fetch target org record Ids by Legacy_ID__c"""
@@ -84,6 +87,7 @@ def build_owner_mapping(sf_source, sf_target, ownerIds):
     """
     owner_mapping = {}
     integration_user_id = os.getenv("INTEGRATION_USER_ID")# Replace with actual integration user Id in target org
+    print(f"Integration User ID: {integration_user_id}")
     if not ownerIds:
         return owner_mapping
 
@@ -151,7 +155,7 @@ def build_owner_mapping(sf_source, sf_target, ownerIds):
         for oid in chunk:
             if oid not in owner_mapping:
                 owner_mapping[oid] = integration_user_id
-
+    print(f"[INFO] Built owner mapping for {len(owner_mapping)} out of {len(ownerIds)} owners.")
     return owner_mapping
 
 def fetch_service_appointment_ids(sf, sa_ids=None, batch_size=500):
@@ -232,7 +236,7 @@ def related_recordid_mapping(sf_source,sf_target,records,object_type):
             doc_ids.add(doc_id)
 
     if not doc_ids:
-        print("⚠️ No <img> tags found in FeedItem bodies, skipping RelatedRecordId mapping")
+        # print("⚠️ No <img> tags found in FeedItem bodies, skipping RelatedRecordId mapping")
         return records  # return unchanged
     
     # Step 2: Fetch latest ContentVersion for all unique ContentDocumentIds

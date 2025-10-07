@@ -13,12 +13,18 @@ from utils.mappings import FILES_DIR
 
 # === Input files for all activity types ===
 INPUT_FILES = [
-    os.path.join(FILES_DIR, "task_import_log.csv"),          # Task
-    # os.path.join(FILES_DIR, "event_import_log.csv"),         # Event
-    # os.path.join(FILES_DIR, "eventMessage_import.csv"),      # EventMessage
+    # os.path.join(FILES_DIR, "task_import_log.csv"),          # Task
+    os.path.join(FILES_DIR, "event_import_log.csv"),         # Event
+    # os.path.join(FILES_DIR, "emailMessage_import.csv"),      # EventMessage
 ]
-OUTPUT_FILE = os.path.join(FILES_DIR, "activity_related_migration.csv")
-LOG_FILE = os.path.join(FILES_DIR, "activity_related_migration.log")
+# OUTPUT_FILE = os.path.join(FILES_DIR, "task_related_migration.csv")
+# LOG_FILE = os.path.join(FILES_DIR, "task_related_migration.log")
+
+OUTPUT_FILE = os.path.join(FILES_DIR, "event_related_migration.csv")
+LOG_FILE = os.path.join(FILES_DIR, "event_related_migration.log")
+
+# OUTPUT_FILE = os.path.join(FILES_DIR, "email_related_migration.csv")
+# LOG_FILE = os.path.join(FILES_DIR, "email_related_migration.log")
 
 # === Enhanced logging setup ===
 def setup_logging(log_level=logging.INFO, enable_debug=False):

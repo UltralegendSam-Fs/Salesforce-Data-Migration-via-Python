@@ -16,9 +16,9 @@ from utils.mappings import fetch_target_mappings,fetch_createdByIds,fetch_servic
  
 from utils.retry_utils import safe_query
 
-EM_export = os.path.join(FILES_DIR, "eventMessage_export.csv")     
-EM_invalid = os.path.join(FILES_DIR, "eventMessage_invalid.csv")     
-EM_import = os.path.join(FILES_DIR, "eventMessage_import.csv")     
+EM_export = os.path.join(FILES_DIR, "emailMessage_export.csv")     
+EM_import = os.path.join(FILES_DIR, "emailMessage_import.csv")     
+EM_invalid = os.path.join(FILES_DIR, "emailMessage_invalid.csv")     
 emailtemplate_mapping = os.path.join(FILES_DIR, "emailtemplate_mapping.csv")
 log_file = os.path.join(FILES_DIR, "emailmessage_migration.log")
 
@@ -44,7 +44,7 @@ def fetch_em_records(sf):
     query = """
         SELECT Id,ParentId,TextBody, HtmlBody,ActivityId,Headers,Subject,FromName,FromAddress,ValidatedFromAddress,ToAddress,CcAddress,BccAddress,Incoming,Status,MessageDate,ReplyToEmailMessageId,MessageIdentifier,ThreadIdentifier,ClientThreadIdentifier,FromId,IsClientManaged,AttachmentIds,RelatedToId, RelatedTo.Type,IsTracked,FirstOpenedDate,LastOpenedDate,IsBounced,EmailTemplateId,EmailRoutingAddressId,AutomationType
         FROM EmailMessage
-        WHERE CreatedDate = TODAY AND RelatedToId != NULL
+        WHERE CreatedDate >= LAST_N_MONTHS:24 AND RelatedToId != NULL
         AND RelatedTo.Type IN ('Impact_Tracker__c','ServiceAppointment')
     """
     logging.info("[DEBUG] Fetching EmailMessages...")
@@ -226,52 +226,52 @@ def export_activity(sf_source, sf_target, object_name, batch_size=200):
 
         prepared_records.append((rec["Id"], insert_data))
 
-    # --- Separate records based on Target_RelatedToId availability ---
+    # --- Separate records based on Target_RelatedToId presence ---
     valid_records = []
     invalid_records = []
-    
+
     for rec in em_records:
-        if rec.get("Target_RelatedToId"):
+        if rec.get("Target_RelatedToId") and (not rec.get("EmailTemplateId") or rec.get("Target_EmailTemplateId")):
             valid_records.append(rec)
         else:
             invalid_records.append(rec)
-    
-    # --- Export valid records (with Target_RelatedToId) ---
+
+    # --- Export mapping for audit ---
     with open(EM_export, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
         header = ["Source_EM_Id", "Source_RelatedId", "Source_FromId",
-                  "Target_FromId", "Target_RelatedToId", "Target_EmailTemplateId"]
+                  "Target_FromId", "Target_RelatedToId","Source_EmailTemplateId", "Target_EmailTemplateId"]
         writer.writerow(header)
         for rec in valid_records:
             writer.writerow([
-                rec["Id"], rec.get("RelatedToId", ""), rec.get("FromId", ""),
-                rec.get("Target_FromId", ""), rec.get("Target_RelatedToId", ""),
+                rec["Id"], 
+                rec.get("RelatedToId", ""), 
+                rec.get("FromId", ""),
+                rec.get("Target_FromId", ""), 
+                rec.get("Target_RelatedToId", ""),
+                rec.get("EmailTemplateId", ""),
                 rec.get("Target_EmailTemplateId", "")
             ])
-    
-    # --- Export invalid records (without Target_RelatedToId) ---
     with open(EM_invalid, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
         header = ["Source_EM_Id", "Source_RelatedId", "Source_FromId",
-                  "Target_FromId", "Target_RelatedToId", "Target_EmailTemplateId"]
+                  "Target_FromId", "Target_RelatedToId","Source_EmailTemplateId", "Target_EmailTemplateId", "Reason"]
         writer.writerow(header)
         for rec in invalid_records:
+            reason = "No mapped parent" if not rec.get("Target_RelatedToId") else "Unmapped EmailTemplate"
             writer.writerow([
-                rec["Id"], rec.get("RelatedToId", ""), rec.get("FromId", ""),
-                rec.get("Target_FromId", ""), rec.get("Target_RelatedToId", ""),
-                rec.get("Target_EmailTemplateId", "")
+                rec["Id"], 
+                rec.get("RelatedToId", ""), 
+                rec.get("FromId", ""),
+                rec.get("Target_FromId", ""), 
+                rec.get("Target_RelatedToId", ""),
+                rec.get("EmailTemplateId", ""),
+                rec.get("Target_EmailTemplateId", ""),
+                reason
             ])
 
-    # --- Log the results ---
-    logging.info(f"[INFO] Total EmailMessage records processed: {len(em_records)}")
-    logging.info(f"[INFO] Valid records (with Target_RelatedToId): {len(valid_records)} → {EM_export}")
-    logging.info(f"[INFO] Invalid records (without Target_RelatedToId): {len(invalid_records)} → {EM_invalid}")
-    logging.info(f"[INFO] Prepared for insertion: {len(prepared_records)} records")
-    logging.info(f"[INFO] Skipped records: {len(skipped_records)}")
-    
-    print(f"[SUCCESS] Prepared {len(prepared_records)} records, skipped {len(skipped_records)}")
-    print(f"[SUCCESS] Valid records (with Target_RelatedToId): {len(valid_records)} → {EM_export}")
-    print(f"[SUCCESS] Invalid records (without Target_RelatedToId): {len(invalid_records)} → {EM_invalid}")
+    print(f"[SUCCESS] Prepared {len(prepared_records)} records, skipped {len(skipped_records)} → {EM_export}")
+
 
     # --- Insert records using the new method ---
     insert_emailmessages(sf_target, object_name, prepared_records, skipped_records, batch_size)
